@@ -1,4 +1,6 @@
 use crate::dialog::{TaskDialogIcon, TaskDialogSpec, show_task_dialog};
+use crate::instance_scope::install_mutex_name;
+use crate::user_identity::current_user_sid;
 use crate::{
     InstanceCommand, InstanceStatus, SingleInstance, instance_status, send_instance_command,
 };
@@ -34,8 +36,6 @@ const STAGING_EXECUTABLE: &str = "StageSwap.exe.installing";
 const PREVIOUS_EXECUTABLE: &str = "StageSwap.exe.previous";
 const INSTANCE_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const REPLACEMENT_READY_TIMEOUT: Duration = Duration::from_secs(120);
-const INSTALL_MUTEX: &str = r"Local\StageSwap.Install";
-
 const INSTALL_BUTTON: i32 = 100;
 const RUN_ONCE_BUTTON: i32 = 101;
 const UPDATE_BUTTON: i32 = 102;
@@ -63,7 +63,7 @@ pub fn bootstrap(payload: &[u8], locale: Locale) -> Result<BootstrapResult, Stri
     let argument = env::args().nth(1);
     if matches!(
         argument.as_deref(),
-        Some("--register-elevated" | "--cleanup-elevated" | "--uninstall-elevated" | "--cleanup")
+        Some("--register-elevated" | "--cleanup-elevated" | "--cleanup")
     ) {
         return Ok(BootstrapResult::Continue(LaunchContext {
             mode: PortableMode::Managed,
@@ -360,6 +360,7 @@ fn uninstall() -> Result<(), String> {
     stop_running_instance()?;
     crate::uninstall_deployment()?;
     remove_shortcuts()?;
+    remove_managed_files()?;
     Ok(())
 }
 
@@ -367,7 +368,7 @@ struct InstallLock(HANDLE);
 
 impl InstallLock {
     fn acquire() -> Result<Self, String> {
-        let name = wide(INSTALL_MUTEX);
+        let name = wide(&install_mutex_name(&current_user_sid()?));
         let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
             .map_err(|error| format!("could not create installation lock: {error}"))?;
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
@@ -647,7 +648,6 @@ mod tests {
         assert_eq!(MANAGED_EXECUTABLE, "StageSwap.exe");
         assert_eq!(STAGING_EXECUTABLE, "StageSwap.exe.installing");
         assert_eq!(PREVIOUS_EXECUTABLE, "StageSwap.exe.previous");
-        assert_eq!(INSTALL_MUTEX, r"Local\StageSwap.Install");
     }
 
     #[test]

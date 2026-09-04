@@ -1,12 +1,19 @@
+use crate::component_compatibility::{ComponentCompatibility, ComponentDecision, decide_component};
 use crate::remove_virtual_camera;
-use stageswap_core::{AppConfig, ConfigStore};
+use semver::Version;
+use stageswap_core::{AppConfig, ConfigStore, IPC_PROTOCOL_VERSION};
 use std::env;
 use std::fs;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, FreeLibrary,
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, FreeLibrary, GetLastError, HANDLE,
+    HLOCAL, LocalFree, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{
     MOVEFILE_DELAY_UNTIL_REBOOT, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
@@ -19,7 +26,8 @@ use windows::Win32::System::Registry::{
 use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_AMD64;
 use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_UNKNOWN;
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetExitCodeProcess, INFINITE, IsWow64Process2, WaitForSingleObject,
+    CreateMutexW, GetCurrentProcess, GetExitCodeProcess, INFINITE, IsWow64Process2, ReleaseMutex,
+    WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -31,6 +39,11 @@ const DEPLOYMENT_DIRECTORY_NAME: &str = "StageSwap";
 const SOURCE_CLASS_KEY: &str = r"Software\Classes\CLSID\{4ABA794D-7B23-449C-8467-CE74A41C2820}";
 const SOURCE_INPROC_KEY: &str =
     r"Software\Classes\CLSID\{4ABA794D-7B23-449C-8467-CE74A41C2820}\InprocServer32";
+const COMPONENT_VERSION_VALUE: &str = "StageSwapComponentVersion";
+const PROTOCOL_MIN_VALUE: &str = "StageSwapProtocolMin";
+const PROTOCOL_MAX_VALUE: &str = "StageSwapProtocolMax";
+const MACHINE_DEPLOYMENT_MUTEX: &str = r"Global\StageSwap.SourceDeployment";
+const MACHINE_DEPLOYMENT_TIMEOUT_MS: u32 = 120_000;
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "StageSwap";
 
@@ -169,11 +182,14 @@ pub fn configure_startup(enabled: bool) -> Result<(), String> {
 }
 
 pub fn cleanup_deployment() -> Result<(), String> {
+    configure_startup(false)?;
+    remove_virtual_camera()?;
     run_elevated("--cleanup-elevated")
 }
 
 pub fn uninstall_deployment() -> Result<(), String> {
-    run_elevated("--uninstall-elevated")
+    configure_startup(false)?;
+    remove_virtual_camera()
 }
 
 pub(crate) fn validate_release(payload: &[u8]) -> Result<(), String> {
@@ -215,16 +231,11 @@ pub fn deployment_startup(payload: &[u8]) -> Result<bool, String> {
             Ok(true)
         }
         Some("--cleanup-elevated") => {
-            cleanup()?;
-            Ok(true)
-        }
-        Some("--uninstall-elevated") => {
-            cleanup()?;
-            crate::portable_install::remove_managed_files()?;
+            cleanup_machine_deployment()?;
             Ok(true)
         }
         Some("--cleanup") => {
-            run_elevated("--cleanup-elevated")?;
+            cleanup_deployment()?;
             Ok(true)
         }
         Some("--startup" | "--show" | "--post-install" | "--post-update" | "--rollback") => {
@@ -246,32 +257,70 @@ fn ensure_deployment(payload: &[u8]) -> Result<(), String> {
     }
     validate_native_architecture()?;
     validate_embedded_source(payload)?;
-    let source = payload_source_path(payload)?;
-    if fs::read(&source).ok().as_deref() != Some(payload) || !source_registration_matches(&source) {
-        run_elevated("--register-elevated")?;
+    let directory = deployment_directory()?;
+    match machine_component_decision(&directory) {
+        ComponentDecision::UseInstalled => return Ok(()),
+        ComponentDecision::RejectNewerIncompatible => {
+            return Err(incompatible_component_error(&directory));
+        }
+        ComponentDecision::InstallEmbedded => run_elevated("--register-elevated")?,
     }
-    if fs::read(&source).ok().as_deref() != Some(payload) {
-        return Err("camera source was not installed correctly".into());
+    match machine_component_decision(&directory) {
+        ComponentDecision::UseInstalled => Ok(()),
+        ComponentDecision::RejectNewerIncompatible => Err(incompatible_component_error(&directory)),
+        ComponentDecision::InstallEmbedded => {
+            Err("camera source was not installed correctly".into())
+        }
     }
-    if !source_registration_matches(&source) {
-        return Err("camera source COM registration was not installed correctly".into());
-    }
-    Ok(())
 }
 
-fn source_registration_matches(source: &Path) -> bool {
-    let Some(registered) = registry_string(SOURCE_INPROC_KEY, None) else {
-        return false;
-    };
-    let Some(threading_model) = registry_string(SOURCE_INPROC_KEY, Some("ThreadingModel")) else {
-        return false;
-    };
-    PathBuf::from(registered)
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&source.to_string_lossy())
-        && threading_model
+struct RegisteredComponent {
+    compatibility: ComponentCompatibility,
+}
+
+fn embedded_component_version() -> Version {
+    Version::parse(env!("CARGO_PKG_VERSION")).expect("workspace version must be valid semver")
+}
+
+fn machine_component_decision(directory: &Path) -> ComponentDecision {
+    let installed = registered_component(directory);
+    decide_component(
+        installed.as_ref().map(|component| &component.compatibility),
+        &embedded_component_version(),
+        IPC_PROTOCOL_VERSION,
+    )
+}
+
+fn registered_component(directory: &Path) -> Option<RegisteredComponent> {
+    let path = PathBuf::from(registry_string(SOURCE_INPROC_KEY, None)?);
+    let threading_model = registry_string(SOURCE_INPROC_KEY, Some("ThreadingModel"))?;
+    if !path.is_file()
+        || !is_managed_source(&path, directory)
+        || !threading_model
             .to_string_lossy()
             .eq_ignore_ascii_case("Both")
+    {
+        return None;
+    }
+    let version = registry_string(SOURCE_CLASS_KEY, Some(COMPONENT_VERSION_VALUE))?;
+    let protocol_min = registry_string(SOURCE_CLASS_KEY, Some(PROTOCOL_MIN_VALUE))?;
+    let protocol_max = registry_string(SOURCE_CLASS_KEY, Some(PROTOCOL_MAX_VALUE))?;
+    Some(RegisteredComponent {
+        compatibility: ComponentCompatibility {
+            version: Version::parse(&version.to_string_lossy()).ok()?,
+            protocol_min: protocol_min.to_string_lossy().parse().ok()?,
+            protocol_max: protocol_max.to_string_lossy().parse().ok()?,
+        },
+    })
+}
+
+fn incompatible_component_error(directory: &Path) -> String {
+    let version = registered_component(directory)
+        .map(|component| component.compatibility.version.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    format!(
+        "the installed StageSwap camera source ({version}) is newer but incompatible with this app; update StageSwap for this Windows user"
+    )
 }
 
 fn registry_string(key: &str, value_name: Option<&str>) -> Option<std::ffi::OsString> {
@@ -383,10 +432,6 @@ fn deployment_directory() -> Result<PathBuf, String> {
         .map(|path| path.join(DEPLOYMENT_DIRECTORY_NAME))
 }
 
-fn payload_source_path(payload: &[u8]) -> Result<PathBuf, String> {
-    Ok(deployment_directory()?.join(payload_source_file_name(payload)))
-}
-
 fn payload_source_file_name(payload: &[u8]) -> String {
     // The filename changes with the payload so an in-use previous DLL never
     // needs to be overwritten. FNV-1a is sufficient here because the trusted
@@ -400,7 +445,15 @@ fn payload_source_file_name(payload: &[u8]) -> String {
 }
 
 fn install(payload: &[u8]) -> Result<(), String> {
+    let _deployment_lock = MachineDeploymentLock::acquire()?;
     let directory = deployment_directory()?;
+    match machine_component_decision(&directory) {
+        ComponentDecision::UseInstalled => return Ok(()),
+        ComponentDecision::RejectNewerIncompatible => {
+            return Err(incompatible_component_error(&directory));
+        }
+        ComponentDecision::InstallEmbedded => {}
+    }
     fs::create_dir_all(&directory)
         .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
     let source = directory.join(payload_source_file_name(payload));
@@ -441,9 +494,8 @@ fn install(payload: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn cleanup() -> Result<(), String> {
-    configure_startup(false)?;
-    let camera_result = remove_virtual_camera();
+fn cleanup_machine_deployment() -> Result<(), String> {
+    let _deployment_lock = MachineDeploymentLock::acquire()?;
     let directory = deployment_directory()?;
     if let Some(source) = registered_managed_source(&directory) {
         let _ = invoke_registration(&source, b"DllUnregisterServer\0");
@@ -451,7 +503,68 @@ fn cleanup() -> Result<(), String> {
     delete_registry_tree(HKEY_LOCAL_MACHINE, SOURCE_CLASS_KEY)?;
     cleanup_managed_sources(&directory, None);
     let _ = fs::remove_dir(&directory);
-    camera_result
+    Ok(())
+}
+
+struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+impl Drop for SecurityDescriptor {
+    fn drop(&mut self) {
+        let _ = unsafe { LocalFree(Some(HLOCAL(self.0.0))) };
+    }
+}
+
+struct MachineDeploymentLock(HANDLE);
+
+impl MachineDeploymentLock {
+    /// Serializes the Program Files payload and HKLM registration across users.
+    fn acquire() -> Result<Self, String> {
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        let sddl: Vec<u16> = "D:P(A;;GA;;;BA)(A;;GA;;;SY)"
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(sddl.as_ptr()),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+        }
+        .map_err(|error| format!("could not secure machine deployment lock: {error}"))?;
+        let descriptor = SecurityDescriptor(descriptor);
+        let security = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0.0,
+            bInheritHandle: false.into(),
+        };
+        let name: Vec<u16> = MACHINE_DEPLOYMENT_MUTEX.encode_utf16().chain([0]).collect();
+        let handle = unsafe { CreateMutexW(Some(&security), false, PCWSTR(name.as_ptr())) }
+            .map_err(|error| format!("could not create machine deployment lock: {error}"))?;
+        drop(descriptor);
+        let wait = unsafe { WaitForSingleObject(handle, MACHINE_DEPLOYMENT_TIMEOUT_MS) };
+        if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+            Ok(Self(handle))
+        } else {
+            let _ = unsafe { CloseHandle(handle) };
+            if wait == WAIT_TIMEOUT {
+                Err("another StageSwap machine deployment did not finish within 120 seconds".into())
+            } else {
+                let error = unsafe { GetLastError() };
+                Err(format!(
+                    "could not wait for the machine deployment lock: {error:?}"
+                ))
+            }
+        }
+    }
+}
+
+impl Drop for MachineDeploymentLock {
+    fn drop(&mut self) {
+        let _ = unsafe { ReleaseMutex(self.0) };
+        let _ = unsafe { CloseHandle(self.0) };
+    }
 }
 
 fn registered_managed_source(directory: &Path) -> Option<PathBuf> {

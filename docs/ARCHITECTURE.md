@@ -70,7 +70,7 @@ Capture sessions are generation-tagged so callbacks from an old session cannot p
 
 ## Virtual camera and stopped state
 
-The app publishes frames through a strict bounded local named-pipe protocol. Sequence monotonicity is enforced within each physical pipe connection; a successful reconnect starts a new sequence epoch and clears the previous cached frame. Stream shutdown marks the stream stopped, cancels and joins its synchronous pipe reader, releases cached frames and allocator state, and then shuts down events without waiting for COM destruction. The activation object's `ShutdownObject` hook remains a no-op for Windows Frame Server compatibility.
+The app publishes frames through a strict bounded local named-pipe protocol. Frame and control pipe names include the owning Windows account SID, so separate user profiles can run concurrently while each account retains only one StageSwap instance across its signed-in sessions. Sequence monotonicity is enforced within each physical pipe connection; a successful reconnect starts a new sequence epoch and clears the previous cached frame. Stream shutdown marks the stream stopped, cancels and joins its synchronous pipe reader, releases cached frames and allocator state, and then shuts down events without waiting for COM destruction. The activation object's `ShutdownObject` hook remains a no-op for Windows Frame Server compatibility.
 
 The Media Foundation source prefers RGB32 1280×720 at 30 fps and exposes NV12 720p for Windows Camera and Zoom compatibility. NV12 uses limited-range BT.601 metadata and caches one conversion per immutable publisher sequence. 1080p is intentionally excluded.
 
@@ -80,13 +80,13 @@ Requested samples are timestamped from the current QPC-correlated Media Foundati
 
 `StageSwap_win64_vX.Y.Z.exe` can run once or install itself per user at `%LocalAppData%\Programs\StageSwap\StageSwap.exe`. The managed copy owns the Start Menu and Desktop shortcuts and is the only executable eligible for Windows startup.
 
-The executable embeds the x64 Media Foundation source DLL. First managed or run-once launch validates native architecture and elevates only when machine-wide camera registration must change; the tray application then runs unelevated. Payloads use content-versioned DLL filenames so a locked older DLL cannot block an update. Unlocked stale copies are removed immediately; locked copies are scheduled for deletion at reboot.
+The executable embeds the x64 Media Foundation source DLL. First managed or run-once launch validates native architecture and elevates only when machine-wide camera registration must change; the tray application then runs unelevated. Machine-wide source changes are serialized across users. The registered component records its semantic version and supported frame-protocol range: older apps accept a newer compatible source and never downgrade it, while an incompatible newer source requires that user to update. Payloads use content-versioned DLL filenames so a locked older DLL cannot block an update. Unlocked stale copies are removed immediately; locked copies are scheduled for deletion at reboot.
 
-A local owner-only control pipe lets duplicate launches show the existing dashboard and lets an approved replacement request graceful shutdown. Replacement stages and verifies the candidate, waits up to ten seconds without force-termination, retains the previous executable until the new instance reports ready, and rolls back startup failure.
+An account-scoped, owner-only control pipe lets duplicate launches show that account's existing dashboard and lets an approved replacement request graceful shutdown without contacting another signed-in user. Replacement stages and verifies the candidate, waits up to ten seconds without force-termination, retains the previous executable until the new instance reports ready, and rolls back startup failure.
 
 The Updates page checks the public GitHub Releases API once at startup and on demand. Stable ignores prereleases; Beta accepts both tracks. Downloads never start automatically. User-approved candidates are bounded, staged locally, and accepted only when release metadata, the versioned filename, the SHA-256 sidecar, and any GitHub digest agree. Installation reuses the replacement and rollback transaction.
 
-`--cleanup` removes StageSwap-owned startup and virtual-camera deployment resources. `--uninstall` also removes the managed executable and shortcuts. Both preserve user data and never modify Automatic Screen Camera resources.
+`--uninstall` removes the current user's startup entry, virtual-camera registration, managed executable, and shortcuts without removing the shared machine source used by other profiles. The explicit administrative `--cleanup` path additionally removes the machine-wide source registration and payloads. Both preserve user data and never modify Automatic Screen Camera resources.
 
 ## Persistence, diagnostics, and administration
 

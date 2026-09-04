@@ -31,7 +31,7 @@ This index connects product contracts to their primary implementation areas and 
 | --- | --- | --- |
 | Deterministic lifecycle, bounded mailbox, ordered actions, coalesced settings, independent shutdown | `RuntimeEngine`; runtime mailbox | Virtual-clock lifecycle, command-flood, ordering, coalescing, and shutdown tests |
 | Deadline-based output pacing without drift or catch-up bursts | `FramePacer` | Long-gap and missed-deadline tests |
-| Strict 40-byte bounded frame IPC with two-second expiry, latest-frame retention, and reconnect-scoped sequence epochs | `FrameHeader`; `SharedFrameCache`; `FramePublisher` | Header, validation, invalidation ordering, reconnect reset, duplicate rejection, publisher-restart, expiry, and slow-consumer IPC tests |
+| Strict 40-byte bounded frame IPC with two-second expiry, latest-frame retention, reconnect-scoped sequence epochs, and per-account pipe identities | `FrameHeader`; `SharedFrameCache`; `FramePublisher`; SID-derived instance scope | Header, validation, invalidation ordering, reconnect reset, account-scope naming, duplicate rejection, publisher-restart, expiry, and slow-consumer IPC tests |
 | Rust Media Foundation COM source implements the required source and stream interfaces and synchronously stops its pipe worker during stream shutdown | `stageswap-media-source::com_server` | Repeated-shutdown, worker-join, retained-sample, Windows COM/source-state tests, and PE validation |
 | RGB32 and NV12 1280×720 at 30 fps; limited-range BT.601 NV12 metadata; no 1080p | `MediaStream` media types and NV12 sequence cache | Color/grayscale conversion and metadata tests; Media Foundation probe; Windows Camera and Zoom checks |
 
@@ -49,9 +49,9 @@ This index connects product contracts to their primary implementation areas and 
 
 | Contract | Primary implementation | Verification evidence |
 | --- | --- | --- |
-| Native self-deploying Windows x64 executable with content-versioned source DLL | Deployment module; embedded resources; `xtask` | PE/payload validation, architecture checks, first-run, registration, and native installation evidence |
+| Native self-deploying Windows x64 executable with content-versioned source DLL and machine-wide, no-downgrade component arbitration | Deployment module; embedded resources; `xtask` | PE/payload validation, architecture checks, component compatibility decisions, first-run, registration, and native installation evidence |
 | Managed startup is transactional; run-once mode preserves installed startup state | Deployment startup helpers; General Settings | Registry status, transition, rollback, reconciliation, and native Windows checks |
-| Cleanup removes deployment resources; uninstall also removes managed app/shortcuts while preserving user data | Deployment cleanup/uninstall paths | Ownership-boundary, argument, filesystem, registry, and native removal checks |
+| Per-user uninstall preserves the shared machine source; explicit administrative cleanup removes machine deployment resources while preserving user data | Deployment cleanup/uninstall paths | Ownership-boundary, argument, filesystem, registry, and native removal checks |
 | Stable/Beta GitHub updates are manual, verified, replaceable, and rollback-safe | Update worker; WinHTTP adapter; replacement bootstrap | Release selection, configuration, checksum/digest, staged replacement, readiness, and rollback tests |
 
 ## Host-executed evidence and release boundaries

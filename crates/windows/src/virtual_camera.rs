@@ -1,8 +1,9 @@
+use crate::user_identity::current_user_sid;
 use core::ffi::c_void;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use windows::Win32::Foundation::{CloseHandle, E_NOTIMPL, HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Foundation::E_NOTIMPL;
 use windows::Win32::Media::MediaFoundation::{
     IMFAsyncCallback, IMFAsyncCallback_Impl, IMFAsyncResult, IMFMediaEvent, IMFVirtualCamera,
     MEError, MEExtendedType, MF_E_INVALIDREQUEST,
@@ -10,12 +11,9 @@ use windows::Win32::Media::MediaFoundation::{
     MFStartup, MFVirtualCameraAccess, MFVirtualCameraAccess_CurrentUser, MFVirtualCameraLifetime,
     MFVirtualCameraLifetime_System, MFVirtualCameraType, MFVirtualCameraType_SoftwareCameraSource,
 };
-use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
-use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows_core::{Error, GUID, HRESULT, Interface, PCSTR, PCWSTR, PWSTR, Ref, implement};
+use windows_core::{Error, GUID, HRESULT, Interface, PCSTR, PCWSTR, Ref, implement};
 
 const SOURCE_ID: &str = "{4ABA794D-7B23-449C-8467-CE74A41C2820}";
 const VIRTUAL_CAMERA_NAME: &str = "Stageswap Camera";
@@ -84,53 +82,8 @@ fn create_virtual_camera(
     Ok(unsafe { IMFVirtualCamera::from_raw(camera) })
 }
 
-struct OwnedHandle(HANDLE);
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        // SAFETY: this wrapper exclusively owns a process-token handle.
-        let _ = unsafe { CloseHandle(self.0) };
-    }
-}
-
 pub fn frame_pipe_name() -> Result<String, String> {
-    let mut token = HANDLE::default();
-    // SAFETY: token points to writable storage and the process pseudo-handle is valid.
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
-        .map_err(|error| format!("could not open process token: {error}"))?;
-    let token = OwnedHandle(token);
-    let mut bytes = 0;
-    // The first call is expected to fail with insufficient buffer and returns
-    // the required byte count.
-    let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut bytes) };
-    if bytes < size_of::<TOKEN_USER>() as u32 {
-        return Err("process token did not contain a user SID".into());
-    }
-    let words = (bytes as usize).div_ceil(size_of::<usize>());
-    let mut storage = vec![0usize; words];
-    // SAFETY: the usize allocation provides TOKEN_USER alignment and sufficient bytes.
-    unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenUser,
-            Some(storage.as_mut_ptr().cast::<c_void>()),
-            bytes,
-            &mut bytes,
-        )
-    }
-    .map_err(|error| format!("could not read process user SID: {error}"))?;
-    // SAFETY: GetTokenInformation initialized TOKEN_USER at the buffer start.
-    let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
-    let mut sid = PWSTR::null();
-    // SAFETY: the token buffer owns a valid SID for the duration of this call.
-    unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid) }
-        .map_err(|error| format!("could not format process user SID: {error}"))?;
-    // SAFETY: the conversion returned a terminated LocalAlloc string.
-    let value = unsafe { sid.to_string() }
-        .map_err(|error| format!("could not decode process user SID: {error}"));
-    // SAFETY: ConvertSidToStringSidW allocated this pointer with LocalAlloc.
-    let _ = unsafe { LocalFree(Some(HLOCAL(sid.0.cast()))) };
-    value.map(|sid| format!("{PIPE_NAME_PREFIX}{sid}"))
+    current_user_sid().map(|sid| format!("{PIPE_NAME_PREFIX}{sid}"))
 }
 
 #[implement(IMFAsyncCallback)]

@@ -6,6 +6,10 @@ compile_error!("StageSwap supports only x64 Windows");
 use stageswap_core::{Frame, MonitorDescriptor};
 use std::sync::Arc;
 
+#[cfg(any(windows, test))]
+mod component_compatibility;
+#[cfg(any(windows, test))]
+mod instance_scope;
 #[cfg(windows)]
 mod pipe;
 #[cfg(windows)]
@@ -57,6 +61,8 @@ mod portable_install;
 mod screen_input;
 #[cfg(windows)]
 mod single_instance;
+#[cfg(windows)]
+mod user_identity;
 #[cfg(windows)]
 pub use deployment::{replace_file_atomic, save_config_atomic};
 #[cfg(windows)]

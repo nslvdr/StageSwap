@@ -22,6 +22,7 @@ eframe = { version = "0.35", default-features = false, features = ["default_font
 image = { version = "0.25.10", default-features = false, features = ["bmp", "jpeg", "png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.150"
+semver = "1.0"
 tray-icon = "0.24"
 windows = "0.62.2"
 windows-core = "0.62.2"

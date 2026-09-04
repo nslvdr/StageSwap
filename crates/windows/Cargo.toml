@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 stageswap-core = { path = "../core" }
 stageswap-i18n = { path = "../i18n" }
+semver.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-core.workspace = true

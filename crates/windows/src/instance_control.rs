@@ -1,3 +1,5 @@
+use crate::instance_scope::control_pipe_name;
+use crate::user_identity::current_user_sid;
 use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -20,7 +22,6 @@ use windows::Win32::System::Pipes::{
 };
 use windows::core::{BOOL, PCWSTR};
 
-const CONTROL_PIPE: &str = r"\\.\pipe\StageSwap.Control";
 const PROTOCOL_VERSION: u8 = 1;
 const RESPONSE_OK: u8 = 1;
 const RESPONSE_READY: u8 = 2;
@@ -64,6 +65,7 @@ impl InstanceReadiness {
 
 impl InstanceControl {
     pub fn start(commands: mpsc::Sender<InstanceCommand>) -> Result<Self, String> {
+        let path = control_pipe_name(&current_user_sid()?);
         let ready = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let worker_ready = Arc::clone(&ready);
@@ -72,7 +74,13 @@ impl InstanceControl {
         let worker = thread::Builder::new()
             .name("stageswap-instance-control".into())
             .spawn(move || {
-                let result = server_loop(&commands, &worker_ready, &worker_stop, &startup_sender);
+                let result = server_loop(
+                    &path,
+                    &commands,
+                    &worker_ready,
+                    &worker_stop,
+                    &startup_sender,
+                );
                 let _ = startup_sender.try_send(result);
             })
             .map_err(|error| format!("could not start instance control: {error}"))?;
@@ -127,7 +135,7 @@ pub fn instance_status() -> Result<InstanceStatus, String> {
 }
 
 fn transact(command: u8) -> Result<u8, String> {
-    let path = wide(CONTROL_PIPE);
+    let path = wide(&control_pipe_name(&current_user_sid()?));
     // Give a busy server a short opportunity to finish the preceding request.
     let _ = unsafe { WaitNamedPipeW(PCWSTR(path.as_ptr()), 1_000) };
     // SAFETY: the path is terminated and the returned handle is owned below.
@@ -171,6 +179,7 @@ impl Drop for SecurityDescriptor {
 }
 
 fn server_loop(
+    path: &str,
     commands: &mpsc::Sender<InstanceCommand>,
     ready: &AtomicBool,
     stop: &AtomicBool,
@@ -193,7 +202,7 @@ fn server_loop(
         lpSecurityDescriptor: descriptor.0,
         bInheritHandle: BOOL(0),
     };
-    let path = wide(CONTROL_PIPE);
+    let path = wide(path);
     let mut startup = Some(startup);
     while !stop.load(Ordering::Acquire) {
         let raw = unsafe {
@@ -292,7 +301,6 @@ mod tests {
 
     #[test]
     fn native_control_identity_and_protocol_are_stable() {
-        assert_eq!(CONTROL_PIPE, r"\\.\pipe\StageSwap.Control");
         assert_eq!(PROTOCOL_VERSION, 1);
         assert_eq!(InstanceCommand::Show.code(), 1);
         assert_eq!(InstanceCommand::ShutdownForReplacement.code(), 2);

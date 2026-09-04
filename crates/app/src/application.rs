@@ -164,7 +164,7 @@ pub(crate) fn run() -> eframe::Result {
     #[cfg(windows)]
     let deployment_command = matches!(
         std::env::args().nth(1).as_deref(),
-        Some("--register-elevated" | "--cleanup-elevated" | "--uninstall-elevated" | "--cleanup")
+        Some("--register-elevated" | "--cleanup-elevated" | "--cleanup")
     );
     #[cfg(windows)]
     if deployment_command {

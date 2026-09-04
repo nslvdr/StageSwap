@@ -1,4 +1,5 @@
 use core::ffi::c_void;
+use stageswap_core::IPC_PROTOCOL_VERSION;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, E_POINTER, ERROR_FILE_NOT_FOUND,
@@ -28,6 +29,9 @@ static SERVER_LOCKS: AtomicUsize = AtomicUsize::new(0);
 static MODULE_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 
 const CLASS_KEY: &str = r"Software\Classes\CLSID\{4ABA794D-7B23-449C-8467-CE74A41C2820}";
+const COMPONENT_VERSION_VALUE: &str = "StageSwapComponentVersion";
+const PROTOCOL_MIN_VALUE: &str = "StageSwapProtocolMin";
+const PROTOCOL_MAX_VALUE: &str = "StageSwapProtocolMax";
 
 struct RegistryKey(HKEY);
 
@@ -112,6 +116,14 @@ fn register_server() -> Result<(), HRESULT> {
     let class = create_key(HKEY_LOCAL_MACHINE, CLASS_KEY)?;
     if let Err(error) = (|| {
         set_string(class.0, None, "StageSwap Media Source")?;
+        set_string(
+            class.0,
+            Some(COMPONENT_VERSION_VALUE),
+            env!("CARGO_PKG_VERSION"),
+        )?;
+        let protocol = IPC_PROTOCOL_VERSION.to_string();
+        set_string(class.0, Some(PROTOCOL_MIN_VALUE), &protocol)?;
+        set_string(class.0, Some(PROTOCOL_MAX_VALUE), &protocol)?;
         let server = create_key(class.0, "InprocServer32")?;
         set_string(server.0, None, &path)?;
         set_string(server.0, Some("ThreadingModel"), "Both")

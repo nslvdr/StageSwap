@@ -32,7 +32,7 @@ pub use image::{
 };
 pub use ipc::{
     CacheError, FRAME_EXPIRY, FrameHeader, HEADER_LEN, HeaderError, MAX_FRAME_BYTES,
-    SharedFrameCache, is_expected_pipe_disconnect,
+    SharedFrameCache, VERSION as IPC_PROTOCOL_VERSION, is_expected_pipe_disconnect,
 };
 pub use monitor::{MonitorTracker, MonitorTrackerSettings, MonitorTrackingResult};
 pub use pacer::FramePacer;
