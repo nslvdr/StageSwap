@@ -23,7 +23,7 @@ use stageswap_core::{MonitorScore, MonitorTracker, MonitorTrackerSettings};
 use stageswap_windows::{
     FramePublisher, FramePublisherDiagnostics, FramePublisherSink, InputDevice,
     MediaFoundationVideoInput, ScreenInput, VideoInput, VirtualCameraController,
-    WindowsGraphicsScreenInput, choose_video_device, frame_pipe_name,
+    WindowsGraphicsScreenInput, choose_video_device, current_session_active, frame_pipe_name,
 };
 #[cfg(any(windows, test))]
 use std::collections::HashSet;
@@ -690,6 +690,7 @@ impl ReversibleMix {
 }
 
 struct RuntimeState {
+    capture_suspended: bool,
     config: AppConfig,
     snapshot: AppSnapshot,
     transition: TransitionController,
@@ -844,6 +845,7 @@ impl RuntimeState {
         })));
         snapshot.previews.reference = reference_preview;
         Self {
+            capture_suspended: false,
             snapshot,
             config,
             transition,
@@ -1174,8 +1176,54 @@ impl RuntimeState {
         })));
     }
 
+    #[cfg(any(windows, test))]
+    /// Releases both native inputs on their owning thread before publishing suspension.
+    fn release_session_capture(
+        &mut self,
+        webcam: &mut impl stageswap_windows::VideoInput,
+        screen: &mut impl stageswap_windows::ScreenInput,
+        now: Instant,
+    ) {
+        webcam.stop();
+        screen.stop();
+        self.set_capture_suspended(true, now);
+    }
+
+    #[cfg(any(windows, test))]
+    /// Suspends live inputs without changing the user's automation or output-mode choice.
+    fn set_capture_suspended(&mut self, suspended: bool, now: Instant) {
+        if self.capture_suspended == suspended {
+            return;
+        }
+        self.capture_suspended = suspended;
+        self.detector.reset();
+        self.reset_still_image_detection();
+        self.snapshot.detection = stageswap_core::DetectionState::Unknown;
+        self.snapshot.previews.webcam = None;
+        self.snapshot.previews.screen = None;
+        self.snapshot.availability = SourceAvailability::default();
+        if suspended {
+            self.snapshot.webcam_state = DeviceState::Unavailable;
+            self.snapshot.screen_state = DeviceState::Unavailable;
+            self.snapshot.webcam_native_format = None;
+            self.snapshot.webcam_output_format = None;
+            for component in [
+                &mut self.snapshot.webcam_component,
+                &mut self.snapshot.screen_component,
+            ] {
+                *component = stageswap_core::ComponentStatus {
+                    state_since: Some(now),
+                    ..stageswap_core::ComponentStatus::default()
+                };
+            }
+            self.clear_warning(WarningSource::WebcamCapture);
+            self.clear_warning(WarningSource::ScreenCapture);
+            self.show_off_output(now);
+        }
+    }
+
     fn tick(&mut self, now: Instant) {
-        if self.snapshot.run_state != RunState::Running {
+        if self.capture_suspended || self.snapshot.run_state != RunState::Running {
             self.show_off_output(now);
             return;
         }
@@ -2177,6 +2225,7 @@ fn choose_initial_monitor(
 
 #[cfg(windows)]
 struct MonitorScanRequest {
+    capture_active: Arc<AtomicBool>,
     generation: u64,
     reference: Option<GrayImage>,
     cursor_visible: bool,
@@ -2254,6 +2303,7 @@ impl<T> CoalescingSlot<T> {
 
 #[cfg(windows)]
 struct MonitorScanWorker {
+    capture_active: Arc<AtomicBool>,
     pending: Arc<CoalescingSlot<MonitorScanRequest>>,
     result: Arc<Mutex<Option<MonitorScanResult>>>,
     stop: Arc<AtomicBool>,
@@ -2263,7 +2313,9 @@ struct MonitorScanWorker {
 
 #[cfg(windows)]
 impl MonitorScanWorker {
-    fn start() -> Result<Self, String> {
+    fn start(active: bool) -> Result<Self, String> {
+        let capture_active = Arc::new(AtomicBool::new(active));
+
         let pending = Arc::new(CoalescingSlot::new());
         let worker_pending = Arc::clone(&pending);
         let result = Arc::new(Mutex::new(None));
@@ -2279,7 +2331,7 @@ impl MonitorScanWorker {
                     let Some(request) = request else {
                         break;
                     };
-                    let scan = scan_monitors(request);
+                    let scan = scan_monitors(request, &worker_stop);
                     if let Ok(mut result) = worker_result.lock() {
                         *result = Some(scan);
                     }
@@ -2288,6 +2340,7 @@ impl MonitorScanWorker {
             })
             .map_err(|error| format!("could not start monitor scan worker: {error}"))?;
         Ok(Self {
+            capture_active,
             pending,
             result,
             stop,
@@ -2413,7 +2466,8 @@ impl Drop for VideoDeviceWorker {
 }
 
 #[cfg(windows)]
-fn scan_monitors(request: MonitorScanRequest) -> MonitorScanResult {
+fn scan_monitors(request: MonitorScanRequest, stop: &AtomicBool) -> MonitorScanResult {
+    let active = &request.capture_active;
     let input = WindowsGraphicsScreenInput::default();
     let monitors = input.enumerate().unwrap_or_default();
     let scores = request
@@ -2423,6 +2477,7 @@ fn scan_monitors(request: MonitorScanRequest) -> MonitorScanResult {
             monitors
                 .iter()
                 .cloned()
+                .take_while(|_| active.load(Ordering::Acquire) && !stop.load(Ordering::Acquire))
                 .map(|monitor| {
                     let mut capture = WindowsGraphicsScreenInput::default();
                     let valid = capture.start(&monitor, request.cursor_visible).is_ok();
@@ -2430,6 +2485,9 @@ fn scan_monitors(request: MonitorScanRequest) -> MonitorScanResult {
                     let frame = valid
                         .then(|| {
                             loop {
+                                if !active.load(Ordering::Acquire) || stop.load(Ordering::Acquire) {
+                                    break None;
+                                }
                                 if let Some(frame) = capture.latest_frame() {
                                     break Some(frame);
                                 }
@@ -2462,6 +2520,9 @@ fn scan_monitors(request: MonitorScanRequest) -> MonitorScanResult {
 
 #[cfg(windows)]
 struct DevicePlatform {
+    session_active: bool,
+    last_session_check: Instant,
+    session_query_failed: bool,
     owner_thread: thread::ThreadId,
     publisher: Option<FramePublisher>,
     camera: Option<VirtualCameraController>,
@@ -2568,6 +2629,13 @@ impl DevicePlatform {
                     .mark_failed(now, "frame publisher is unavailable");
             }
         }
+        let session_active = match current_session_active() {
+            Ok(active) => active,
+            Err(error) => {
+                state.record(error);
+                false
+            }
+        };
         let mut webcam = MediaFoundationVideoInput::default();
         webcam.set_crop_to_16_9(state.config.crop_webcam_to_16_9);
         state
@@ -2586,9 +2654,14 @@ impl DevicePlatform {
                     .into();
                 let saved = state.config.selected_video_device_id.clone();
                 let saved_is_physical = devices.iter().any(|device| device.id == saved);
-                let saved_opened = saved_is_physical && webcam.start(&saved).is_ok();
-                let selected = choose_video_device(&saved, &devices, saved_opened);
-                let opened = if saved_opened {
+                let saved_opened =
+                    saved_is_physical && session_active && webcam.start(&saved).is_ok();
+                let selected = choose_video_device(
+                    &saved,
+                    &devices,
+                    saved_opened || (!session_active && saved_is_physical),
+                );
+                let opened = if saved_opened || !session_active {
                     selected
                 } else if let Some(selected) = selected {
                     match webcam.start(&selected) {
@@ -2606,17 +2679,19 @@ impl DevicePlatform {
                     state.config.selected_video_device_id = selected;
                     state.snapshot.selected_video_device_id =
                         state.config.selected_video_device_id.clone();
-                    state.snapshot.webcam_state = DeviceState::Initializing;
-                    state
-                        .snapshot
-                        .webcam_component
-                        .waiting_for_first_frame(now, now + WEBCAM_FIRST_FRAME_TIMEOUT);
-                    state.snapshot.webcam_native_format =
-                        webcam.selected_native_format().map(str::to_owned);
-                    state.snapshot.webcam_output_format =
-                        webcam.selected_output_format().map(str::to_owned);
-                    Self::record_webcam_format(state, &webcam);
-                    state.record("Webcam initialized");
+                    if session_active {
+                        state.snapshot.webcam_state = DeviceState::Initializing;
+                        state
+                            .snapshot
+                            .webcam_component
+                            .waiting_for_first_frame(now, now + WEBCAM_FIRST_FRAME_TIMEOUT);
+                        state.snapshot.webcam_native_format =
+                            webcam.selected_native_format().map(str::to_owned);
+                        state.snapshot.webcam_output_format =
+                            webcam.selected_output_format().map(str::to_owned);
+                        Self::record_webcam_format(state, &webcam);
+                        state.record("Webcam initialized");
+                    }
                 } else if devices.is_empty() {
                     state
                         .snapshot
@@ -2651,30 +2726,35 @@ impl DevicePlatform {
             Ok(monitors) => {
                 state.snapshot.monitors = monitors.clone().into();
                 choose_initial_monitor(&state.config.selected_monitor_label, &monitors).and_then(
-                    |monitor| match screen.start(&monitor, state.config.cursor_visible) {
-                        Ok(()) => {
-                            state.snapshot.screen_state = DeviceState::Initializing;
-                            state
-                                .snapshot
-                                .screen_component
-                                .waiting_for_first_frame(now, now + SCREEN_FIRST_FRAME_TIMEOUT);
-                            state.record(format!(
-                                "Screen capture initialized: {} generation={}",
-                                monitor.label,
-                                screen.generation()
-                            ));
-                            Some(monitor)
+                    |monitor| {
+                        if !session_active {
+                            return Some(monitor);
                         }
-                        Err(error) => {
-                            state.snapshot.screen_state = DeviceState::Failed;
-                            state.snapshot.screen_component.mark_failed_with_kind(
-                                now,
-                                ComponentFailureKind::Screen(screen_failure_kind(&error)),
-                                error.clone(),
-                            );
-                            state.set_warning(WarningSource::ScreenCapture, error.clone());
-                            state.record(format!("Screen capture failed: {error}"));
-                            None
+                        match screen.start(&monitor, state.config.cursor_visible) {
+                            Ok(()) => {
+                                state.snapshot.screen_state = DeviceState::Initializing;
+                                state
+                                    .snapshot
+                                    .screen_component
+                                    .waiting_for_first_frame(now, now + SCREEN_FIRST_FRAME_TIMEOUT);
+                                state.record(format!(
+                                    "Screen capture initialized: {} generation={}",
+                                    monitor.label,
+                                    screen.generation()
+                                ));
+                                Some(monitor)
+                            }
+                            Err(error) => {
+                                state.snapshot.screen_state = DeviceState::Failed;
+                                state.snapshot.screen_component.mark_failed_with_kind(
+                                    now,
+                                    ComponentFailureKind::Screen(screen_failure_kind(&error)),
+                                    error.clone(),
+                                );
+                                state.set_warning(WarningSource::ScreenCapture, error.clone());
+                                state.record(format!("Screen capture failed: {error}"));
+                                None
+                            }
                         }
                     },
                 )
@@ -2728,7 +2808,7 @@ impl DevicePlatform {
         } else {
             state.clear_warning(WarningSource::Hdr);
         }
-        let monitor_scan_worker = match MonitorScanWorker::start() {
+        let monitor_scan_worker = match MonitorScanWorker::start(session_active) {
             Ok(worker) => Some(worker),
             Err(error) => {
                 state.record(error);
@@ -2742,7 +2822,11 @@ impl DevicePlatform {
                 None
             }
         };
+        state.set_capture_suspended(!session_active, now);
         let mut platform = Self {
+            session_active,
+            last_session_check: now,
+            session_query_failed: false,
             owner_thread: thread::current().id(),
             publisher,
             camera,
@@ -2769,6 +2853,7 @@ impl DevicePlatform {
 
     fn command(&mut self, command: &Command, state: &mut RuntimeState) {
         self.assert_owner_thread();
+        self.refresh_session(state, Instant::now());
         match command {
             Command::UpdateSettings(config) | Command::ReloadSettings(config) => {
                 let reload_settings = matches!(command, Command::ReloadSettings(_));
@@ -2781,7 +2866,7 @@ impl DevicePlatform {
                     self.webcam.stop();
                     state.snapshot.webcam_native_format = None;
                     state.snapshot.webcam_output_format = None;
-                    if config.selected_video_device_id.is_empty() {
+                    if config.selected_video_device_id.is_empty() || !self.session_active {
                         state.snapshot.webcam_state = DeviceState::Unavailable;
                         state
                             .snapshot
@@ -2965,6 +3050,56 @@ impl DevicePlatform {
         }
     }
 
+    /// Checks the owning session on the device thread, independently of dashboard visibility.
+    fn refresh_session(&mut self, state: &mut RuntimeState, now: Instant) {
+        if now.saturating_duration_since(self.last_session_check) < Duration::from_millis(250) {
+            return;
+        }
+        self.last_session_check = now;
+        let active = match current_session_active() {
+            Ok(active) => {
+                self.session_query_failed = false;
+                active
+            }
+            Err(error) => {
+                if !self.session_query_failed {
+                    state.record(error);
+                }
+                self.session_query_failed = true;
+                false
+            }
+        };
+        if active == self.session_active {
+            return;
+        }
+        self.session_active = active;
+        self.invalidate_monitor_scans(state.config.similarity_threshold);
+        if let Some(worker) = &mut self.monitor_scan_worker {
+            worker.capture_active.store(false, Ordering::Release);
+            if active {
+                worker.capture_active = Arc::new(AtomicBool::new(true));
+            }
+        }
+        self.webcam_recovery.reset();
+        self.screen_capture_recovery.reset();
+        self.last_monitor_scan = now;
+        self.last_screen_capture_recovery_check = now;
+        if active {
+            state.set_capture_suspended(false, now);
+            self.webcam
+                .set_crop_to_16_9(state.config.crop_webcam_to_16_9);
+            self.restart_webcam(state);
+            self.restart_screen(state);
+            if state.config.automatic_monitor_rescans {
+                self.request_monitor_scan(state, state.config.cursor_visible);
+            }
+            state.record("Windows session active: capture resumed");
+        } else {
+            state.release_session_capture(&mut self.webcam, &mut self.screen, now);
+            state.record("Windows session inactive: capture released");
+        }
+    }
+
     fn synchronize_hdr_warning(&self, state: &mut RuntimeState) {
         if self.selected_display_hdr_unsupported {
             state.set_warning(
@@ -3087,6 +3222,9 @@ impl DevicePlatform {
     }
 
     fn restart_webcam(&mut self, state: &mut RuntimeState) {
+        if !self.session_active {
+            return;
+        }
         let now = Instant::now();
         let id = state.config.selected_video_device_id.clone();
         if state.snapshot.webcam_component.lifecycle == ComponentLifecycle::Restarting {
@@ -3180,6 +3318,10 @@ impl DevicePlatform {
 
     fn refresh_inputs(&mut self, state: &mut RuntimeState, now: Instant) {
         self.assert_owner_thread();
+        self.refresh_session(state, now);
+        if !self.session_active {
+            return;
+        }
         self.refresh_video_device_result(state);
         self.refresh_monitor_scan(state);
         let (monitor_scan_due, screen_capture_recovery_due) = automatic_screen_tasks_due(
@@ -3406,6 +3548,9 @@ impl DevicePlatform {
     }
 
     fn restart_screen_with_policy(&mut self, state: &mut RuntimeState, automatic: bool) {
+        if !self.session_active {
+            return;
+        }
         let now = Instant::now();
         if automatic
             && state
@@ -3517,10 +3662,14 @@ impl DevicePlatform {
     }
 
     fn queue_monitor_scan(&mut self, state: &RuntimeState, cursor_visible: bool) -> bool {
+        if !self.session_active {
+            return true;
+        }
         let Some(worker) = &mut self.monitor_scan_worker else {
             return false;
         };
         if worker.request(MonitorScanRequest {
+            capture_active: Arc::clone(&worker.capture_active),
             generation: self.monitor_scan_generation,
             reference: state.reference.clone(),
             cursor_visible,
@@ -3663,6 +3812,7 @@ impl PendingDeviceCommands {
 #[cfg(windows)]
 #[derive(Default)]
 struct DeviceSnapshot {
+    capture_suspended: bool,
     app: AppSnapshot,
     warnings: WarningRegistry,
     observed_at: Option<Instant>,
@@ -3865,6 +4015,7 @@ fn publish_device_snapshot(
     candidate_event: &Option<(u64, Option<Arc<Frame>>)>,
 ) {
     let snapshot = DeviceSnapshot {
+        capture_suspended: state.capture_suspended,
         app: state.snapshot.clone(),
         warnings: state.warnings.clone(),
         observed_at: Some(Instant::now()),
@@ -3915,6 +4066,7 @@ impl Platform {
         };
         let device = worker.snapshot();
         let app = &device.app;
+        state.set_capture_suspended(device.capture_suspended, now);
         if device.observed_at.is_some_and(|observed_at| {
             now.saturating_duration_since(observed_at) > FRAME_STALE_AFTER
         }) {
@@ -4852,6 +5004,134 @@ mod tests {
                 .map(String::as_str),
             Some("Reference loaded")
         );
+    }
+
+    #[test]
+    fn flow_session_disconnect_clears_capture_and_preserves_user_intent() {
+        #[derive(Default)]
+        struct Capture {
+            stops: u32,
+        }
+        impl stageswap_windows::VideoInput for Capture {
+            fn enumerate(&self) -> Result<Vec<stageswap_windows::InputDevice>, String> {
+                Ok(Vec::new())
+            }
+            fn start(&mut self, _id: &str) -> Result<(), String> {
+                panic!("suspension must not open capture")
+            }
+            fn stop(&mut self) {
+                self.stops += 1;
+            }
+            fn latest_frame(&self) -> Option<Arc<Frame>> {
+                None
+            }
+        }
+        impl stageswap_windows::ScreenInput for Capture {
+            fn enumerate(&self) -> Result<Vec<MonitorDescriptor>, String> {
+                Ok(Vec::new())
+            }
+            fn start(&mut self, _monitor: &MonitorDescriptor, _cursor: bool) -> Result<(), String> {
+                panic!("suspension must not open capture")
+            }
+            fn stop(&mut self) {
+                self.stops += 1;
+            }
+            fn latest_frame(&self) -> Option<Arc<Frame>> {
+                None
+            }
+        }
+        let mut webcam = Capture::default();
+        let mut screen = Capture::default();
+        let now = Instant::now();
+        let mut state = running_scripted_state(now);
+        state.apply_command(Command::SetMode(OutputMode::ForceScreen), false);
+        state.config.selected_video_device_id = "saved-webcam".into();
+        state.config.selected_monitor_label = "saved-screen".into();
+        state.snapshot.previews.webcam =
+            Some(scripted_solid_frame(PIPELINE_SIZE, 0xff123456, 1, now));
+        state.snapshot.previews.screen = state.snapshot.previews.webcam.clone();
+        state.snapshot.availability = SourceAvailability {
+            camera_ready: true,
+            screen_ready: true,
+        };
+        state
+            .snapshot
+            .webcam_component
+            .waiting_for_first_frame(now, now + WEBCAM_FIRST_FRAME_TIMEOUT);
+        state
+            .snapshot
+            .screen_component
+            .waiting_for_first_frame(now, now + SCREEN_FIRST_FRAME_TIMEOUT);
+        state.release_session_capture(&mut webcam, &mut screen, now);
+        assert_eq!((webcam.stops, screen.stops), (1, 1));
+        assert!(state.snapshot.previews.webcam.is_none());
+        assert!(state.snapshot.previews.screen.is_none());
+        assert_eq!(state.snapshot.availability, SourceAvailability::default());
+        assert_eq!(
+            state.snapshot.webcam_component.lifecycle,
+            ComponentLifecycle::Stopped
+        );
+        assert_eq!(
+            state.snapshot.screen_component.lifecycle,
+            ComponentLifecycle::Stopped
+        );
+        assert!(
+            state
+                .snapshot
+                .webcam_component
+                .first_frame_deadline
+                .is_none()
+        );
+        assert!(
+            state
+                .snapshot
+                .screen_component
+                .first_frame_deadline
+                .is_none()
+        );
+        assert_eq!(state.snapshot.run_state, RunState::Running);
+        assert_eq!(state.snapshot.mode, OutputMode::ForceScreen);
+
+        // Start and mode commands cannot bypass suspension; idle frames keep advancing.
+        state.apply_command(Command::Start, false);
+        state.apply_command(Command::SetMode(OutputMode::ForceCamera), false);
+        let previous = state
+            .snapshot
+            .previews
+            .final_output
+            .as_ref()
+            .unwrap()
+            .sequence;
+        state.tick(now + Duration::from_millis(34));
+        let output = state.snapshot.previews.final_output.as_ref().unwrap();
+        assert!(output.sequence > previous);
+        assert_eq!(
+            output.pixels(),
+            off_frame(FrameMetadata {
+                sequence: 1,
+                timestamp_100ns: 0,
+                received_at: now,
+            })
+            .pixels()
+        );
+
+        state.set_capture_suspended(false, now + Duration::from_secs(1));
+        assert_eq!(state.snapshot.run_state, RunState::Running);
+        assert_eq!(state.snapshot.mode, OutputMode::ForceCamera);
+        assert_eq!(state.config.selected_video_device_id, "saved-webcam");
+        assert_eq!(state.config.selected_monitor_label, "saved-screen");
+        assert_eq!(state.snapshot.availability, SourceAvailability::default());
+        // A fresh capture survives repeated observations of an already active session.
+        state.snapshot.previews.webcam =
+            Some(scripted_solid_frame(PIPELINE_SIZE, 0xff123456, 2, now));
+        state.set_capture_suspended(false, now + Duration::from_secs(2));
+        assert!(state.snapshot.previews.webcam.is_some());
+        state.set_capture_suspended(true, now + Duration::from_secs(3));
+        state.apply_command(Command::Stop, false);
+        state.set_capture_suspended(false, now + Duration::from_secs(4));
+        assert_eq!(state.snapshot.run_state, RunState::Stopped);
+        state.tick(now + Duration::from_secs(4));
+        assert_eq!(state.snapshot.actual_output, Source::Placeholder);
     }
 
     #[test]

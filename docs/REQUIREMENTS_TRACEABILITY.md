@@ -23,6 +23,7 @@ This index connects product contracts to their primary implementation areas and 
 | Windows Graphics Capture with cursor option, capability/HDR preflight, session-valid readiness, and two transient processing failures before terminal failure | `WindowsGraphicsScreenInput`; per-generation failure streak; `DevicePlatform` | Retained-frame, streak-reset, third-failure, closure, old-generation, SDR/HDR, and native capture checks |
 | Four-slot capture pools cannot stall when consumers temporarily retain every slot | `FrameBufferPool`; webcam and screen normalization | Pool-exhaustion fallback, recovery/reuse, pressure-counter, and cross-target checks |
 | Reference discovery is bounded, nonblocking, and requires the same winning display twice | `MonitorTracker`; monitor-scan worker | Ranking, confirmation, coalescing, shutdown, and multi-monitor tests |
+| Inactive Windows sessions release capture; active sessions reopen selected sources without changing user intent | `current_session_active`; device-worker session polling; runtime suspension | Host flow test for input release, cleared readiness/deadlines, paced off frames, and preserved Start/Stop and mode; Windows cross-target lint (no physical session test) |
 | Selected-screen recovery checks only the stored display and restarts after two black/missing samples | Runtime recovery scheduler; screen lifecycle | Interval, threshold, confirmation-reset, retry, and stored-identity tests |
 
 ## Runtime, IPC, and virtual camera

@@ -60,6 +60,8 @@ mod portable_install;
 #[cfg(windows)]
 mod screen_input;
 #[cfg(windows)]
+mod session;
+#[cfg(windows)]
 mod single_instance;
 #[cfg(windows)]
 mod user_identity;
@@ -77,6 +79,8 @@ pub use portable_install::{
 };
 #[cfg(windows)]
 pub use screen_input::WindowsGraphicsScreenInput;
+#[cfg(windows)]
+pub use session::current_session_active;
 #[cfg(windows)]
 pub use single_instance::SingleInstance;
 

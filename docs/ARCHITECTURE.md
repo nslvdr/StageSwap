@@ -76,6 +76,8 @@ The Media Foundation source prefers RGB32 1280×720 at 30 fps and exposes NV12 7
 
 Requested samples are timestamped from the current QPC-correlated Media Foundation clock. When the publisher is disconnected, invalid, or stale, the source generates the canonical black off frame with the centered StageSwap icon. The running app publishes that same frame at 30 fps while automatic switching is stopped.
 
+The device worker checks its own Windows session connection state every 250 ms. When the session is inactive, it releases webcam and selected-screen capture, cancels pending and in-flight reference-monitor scans, and suspends capture recovery. Output continues at 30 fps with the canonical off frame, without changing the user's Start/Stop state or output mode. When the session becomes active again, it reopens the selected sources using the current settings and resumes normal discovery and recovery; source readiness requires new frames. Session-query failures also suspend capture until a successful active-session query. This is connection-state handling, not general sleep/resume or display hot-plug recovery.
+
 ## Deployment and updates
 
 `StageSwap_win64_vX.Y.Z.exe` can run once or install itself per user at `%LocalAppData%\Programs\StageSwap\StageSwap.exe`. The managed copy owns the Start Menu and Desktop shortcuts and is the only executable eligible for Windows startup.
