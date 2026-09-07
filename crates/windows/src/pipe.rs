@@ -241,12 +241,25 @@ impl FramePublisherSink {
 
 impl Drop for FramePublisher {
     fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Release);
-        self.shared.changed.notify_all();
+        // Serialize the stop predicate with the condition-variable waiter.
+        {
+            let _latest = self
+                .shared
+                .latest
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.shared.stop.store(true, Ordering::Release);
+            self.shared.changed.notify_all();
+        }
         if let Some(worker) = self.worker.take() {
             // SAFETY: this is the live worker thread handle and cancellation is
             // limited to its blocking ConnectNamedPipe/WriteFile calls.
-            let _ = unsafe { CancelSynchronousIo(HANDLE(worker.as_raw_handle())) };
+            // Cancellation only covers I/O already in progress. Retry until the
+            // worker exits to cover an operation started just after cancellation.
+            while !worker.is_finished() {
+                let _ = unsafe { CancelSynchronousIo(HANDLE(worker.as_raw_handle())) };
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
             let _ = worker.join();
         }
     }
@@ -454,6 +467,44 @@ mod tests {
         let second = FramePublisher::start(&name);
         assert!(second.is_err(), "duplicate publisher unexpectedly started");
         drop(first);
+    }
+
+    #[test]
+    fn native_shutdown_completes_without_a_client_or_with_a_stalled_client() {
+        let (done, completion) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            for scenario in 0..3 {
+                let name = format!(
+                    r"\\.\pipe\StageSwap.ShutdownTest.{}.{}",
+                    std::process::id(),
+                    scenario
+                );
+                let publisher = FramePublisher::start(&name).unwrap();
+                // Keep the client open through shutdown without reading from it.
+                let client = (scenario != 0)
+                    .then(|| std::fs::OpenOptions::new().read(true).open(&name).unwrap());
+                if scenario == 2 {
+                    let frame = Frame::placeholder(
+                        stageswap_core::PIPELINE_SIZE,
+                        0xff00_0000,
+                        1,
+                        0,
+                        Instant::now(),
+                    );
+                    // Fill the pipe and leave the publisher blocked writing the payload.
+                    for _ in 0..4 {
+                        publisher.publish(&frame).unwrap();
+                        thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }
+                drop(publisher);
+                drop(client);
+            }
+            done.send(()).unwrap();
+        });
+        completion
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("pipe shutdown must complete even when the client does not read");
     }
 
     #[test]

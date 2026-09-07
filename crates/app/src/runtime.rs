@@ -2097,6 +2097,8 @@ impl<P: RuntimePorts> RuntimeEngine<P> {
                         self.state.snapshot.previews.reference = None;
                         self.state.detector.reset();
                         self.state.snapshot.detection = stageswap_core::DetectionState::Unknown;
+                        self.state.reset_still_image_detection();
+                        self.platform.reference_updated(&mut self.state);
                     }
                     self.state
                         .set_warning(WarningSource::Reference, error.clone());
@@ -3362,6 +3364,7 @@ impl DevicePlatform {
             now.saturating_duration_since(frame.received_at) > FRAME_STALE_AFTER
         });
         let webcam = (!webcam_is_stale).then_some(webcam).flatten();
+        state.snapshot.previews.webcam = None;
         state.snapshot.availability.camera_ready = webcam.is_some();
         if let Some(failure) = self.webcam.last_failure() {
             let error = failure.message.clone();
@@ -3401,6 +3404,7 @@ impl DevicePlatform {
             state.snapshot.webcam_component.mark_ready(now);
             state.snapshot.webcam_component.last_success_at =
                 webcam.as_ref().map(|frame| frame.received_at);
+            state.snapshot.previews.webcam = webcam;
             if !was_ready {
                 state.record("Webcam first frame received");
             }
@@ -3426,9 +3430,6 @@ impl DevicePlatform {
             state.snapshot.previews.webcam = None;
             state.record("Webcam first-frame deadline expired");
             self.queue_webcam_recovery(state, now, error);
-        }
-        if let Some(webcam) = webcam {
-            state.snapshot.previews.webcam = Some(webcam);
         }
         self.attempt_webcam_recovery(state, now);
         let screen = self.screen.latest_frame();
@@ -3747,11 +3748,18 @@ struct PendingDeviceCommands {
     capture_candidate: bool,
     discard_candidate: bool,
     restarts: HashSet<RestartTarget>,
-    reference: Option<GrayImage>,
+    // Outer None means no update; Some(None) explicitly clears the reference.
+    reference: Option<Option<GrayImage>>,
 }
 
 #[cfg(any(windows, test))]
 impl PendingDeviceCommands {
+    /// Coalesces installs and explicit clears while dismissing obsolete candidates.
+    fn update_reference(&mut self, reference: Option<GrayImage>) {
+        self.reference = Some(reference);
+        self.discard_candidate = true;
+    }
+
     fn push(&mut self, command: &Command) {
         match command {
             command @ (Command::UpdateSettings(_) | Command::ReloadSettings(_)) => {
@@ -3776,7 +3784,7 @@ impl PendingDeviceCommands {
         }
     }
 
-    fn take(&mut self) -> (Vec<Command>, Option<GrayImage>) {
+    fn take(&mut self) -> (Vec<Command>, Option<Option<GrayImage>>) {
         let mut commands = Vec::with_capacity(9);
         commands.extend(self.settings.take());
         commands.extend(self.mode.take());
@@ -3884,7 +3892,7 @@ impl DeviceWorker {
                             .take()
                     };
                     if let Some(reference) = reference {
-                        state.reference = Some(reference);
+                        state.reference = reference;
                         platform.reference_updated(&mut state);
                     }
                     for command in commands {
@@ -3966,13 +3974,9 @@ impl DeviceWorker {
     }
 
     fn update_reference(&self, reference: Option<GrayImage>) {
-        let Some(reference) = reference else {
-            return;
-        };
         let (lock, changed) = &*self.pending;
         let mut pending = lock.lock().expect("device command state is not poisoned");
-        pending.reference = Some(reference);
-        pending.discard_candidate = true;
+        pending.update_reference(reference);
         drop(pending);
         changed.notify_one();
     }
@@ -4026,6 +4030,20 @@ fn publish_device_snapshot(
     *destination
         .write()
         .expect("device snapshot state is not poisoned") = Arc::new(snapshot);
+}
+
+/// Accepts only frames that the capture worker considers usable and are still fresh.
+#[cfg(any(windows, test))]
+fn ready_webcam_frame(snapshot: &AppSnapshot, now: Instant) -> Option<Arc<Frame>> {
+    snapshot
+        .previews
+        .webcam
+        .as_ref()
+        .filter(|frame| {
+            snapshot.availability.camera_ready
+                && frame.is_fresh_at(now, stageswap_core::FRAME_STALE_AFTER)
+        })
+        .cloned()
 }
 
 #[cfg(windows)]
@@ -4101,9 +4119,7 @@ impl Platform {
             .webcam
             .as_ref()
             .is_some_and(|frame| !frame.is_fresh_at(now, FRAME_STALE_AFTER));
-        let webcam = (!webcam_is_stale)
-            .then(|| app.previews.webcam.clone())
-            .flatten();
+        let webcam = ready_webcam_frame(app, now);
         state.snapshot.previews.webcam = webcam;
         if webcam_is_stale {
             state.snapshot.webcam_state = DeviceState::Failed;
@@ -4315,6 +4331,7 @@ mod tests {
         screen: Option<Arc<Frame>>,
         published: Mutex<Vec<Arc<Frame>>>,
         refresh_count: usize,
+        reference_updates: Vec<Option<GrayImage>>,
     }
 
     impl ScriptedRuntimePorts {
@@ -4324,6 +4341,10 @@ mod tests {
     }
 
     impl RuntimePorts for ScriptedRuntimePorts {
+        fn reference_updated(&mut self, state: &mut RuntimeState) {
+            self.reference_updates.push(state.reference.clone());
+        }
+
         fn command(&mut self, _command: &Command, _state: &mut RuntimeState) {}
 
         fn refresh_inputs(&mut self, state: &mut RuntimeState, _now: Instant) {
@@ -5004,6 +5025,18 @@ mod tests {
                 .map(String::as_str),
             Some("Reference loaded")
         );
+        assert!(engine.platform.reference_updates.last().unwrap().is_some());
+        result_sender
+            .send(ReferenceResult {
+                generation: 2,
+                action: ReferenceAction::Load,
+                result: Err("reference was removed".into()),
+            })
+            .unwrap();
+        engine.poll_reference_results(start + Duration::from_millis(2));
+        assert!(engine.state.reference.is_none());
+        assert!(engine.state.snapshot.previews.reference.is_none());
+        assert_eq!(engine.platform.reference_updates.last(), Some(&None));
     }
 
     #[test]
@@ -5756,6 +5789,24 @@ mod tests {
     }
 
     #[test]
+    fn flow_webcam_failure_and_staleness_exclude_retained_frames() {
+        let now = Instant::now();
+        let mut snapshot = RuntimeState::new_at(AppConfig::default(), now).snapshot;
+        let frame = scripted_solid_frame(Size::new(2, 2), 0xff40_4040, 1, now);
+        snapshot.previews.webcam = Some(Arc::clone(&frame));
+        snapshot.availability.camera_ready = false;
+        assert!(ready_webcam_frame(&snapshot, now).is_none());
+        snapshot.availability.camera_ready = true;
+        assert!(Arc::ptr_eq(
+            &ready_webcam_frame(&snapshot, now).unwrap(),
+            &frame
+        ));
+        assert!(ready_webcam_frame(&snapshot, now + Duration::from_secs(2)).is_none());
+        snapshot.previews.webcam = None;
+        assert!(ready_webcam_frame(&snapshot, now).is_none());
+    }
+
+    #[test]
     fn flow_device_commands_are_bounded_coalesced_and_restart_all_subsumes_individuals() {
         let mut pending = PendingDeviceCommands::default();
         let first = AppConfig {
@@ -5796,6 +5847,12 @@ mod tests {
         assert!(!commands.contains(&Command::Restart(RestartTarget::Webcam)));
         assert!(!commands.contains(&Command::Restart(RestartTarget::ScreenCapture)));
         assert!(pending.take().0.is_empty());
+        pending.update_reference(Some(GrayImage::new(Size::new(1, 1), vec![1]).unwrap()));
+        pending.update_reference(None);
+        let (commands, reference) = pending.take();
+        assert_eq!(reference, Some(None));
+        assert!(commands.contains(&Command::DiscardReferenceCandidate));
+        assert_eq!(pending.take().1, None);
     }
 
     #[test]

@@ -50,7 +50,12 @@ impl PipeReader {
         if let Some(worker) = self.worker.take() {
             // SAFETY: the raw handle belongs to the still-live worker thread and
             // is used only to cancel its synchronous named-pipe open or read.
-            let _ = unsafe { CancelSynchronousIo(HANDLE(worker.as_raw_handle())) };
+            // Cancellation only covers I/O already in progress. Retry until the
+            // worker exits to cover an operation started just after cancellation.
+            while !worker.is_finished() {
+                let _ = unsafe { CancelSynchronousIo(HANDLE(worker.as_raw_handle())) };
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
             let _ = worker.join();
         }
     }

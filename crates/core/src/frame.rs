@@ -355,8 +355,8 @@ struct ScalePlan {
     output: Size,
     x_offset: u32,
     y_offset: u32,
-    source_x: Vec<usize>,
-    source_rows: Vec<usize>,
+    source_x: Arc<[usize]>,
+    source_rows: Arc<[usize]>,
 }
 
 impl ScalePlan {
