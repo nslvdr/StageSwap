@@ -1,6 +1,6 @@
 # StageSwap localization guide
 
-StageSwap uses clear, natural product language in English, French, and neutral international Spanish. Translate the user’s task and the visible result, not the English sentence word for word. Keep labels concise, then use nearby explanatory copy when a concept needs more context.
+Use this guide when editing UI strings in `crates/i18n`. Translate tasks and visible results naturally in English, French, and neutral international Spanish. Keep labels concise; explain unfamiliar concepts nearby. See [Development](DEVELOPMENT.md#deterministic-ui-previews) to review translations in context.
 
 ## Approved terminology
 
@@ -29,8 +29,7 @@ StageSwap uses clear, natural product language in English, French, and neutral i
 
 ## Context rules
 
-- Use **Secondary screen** in page titles and explanations. Use **Screen** only in compact mode controls where it appears beside **Auto** and **Camera**.
-- Use **Webcam** for the physical device. Use **Camera** only for the compact forced-output mode.
+- Use **Secondary screen** and **Webcam** in explanations. Reserve **Screen** and **Camera** for compact output-mode controls.
 - Describe the reference condition as “the screen JW Library shows when no media is playing.” Translate the idea naturally as “l’écran affiché par JW Library lorsqu’aucun média n’est en cours de lecture” and “la pantalla que muestra JW Library cuando no se reproduce contenido multimedia.”
 - Use “Zoom sees” only when English copy describes the virtual-camera output. Copy about the secondary screen must describe it as the screen StageSwap watches.
 - In short French states, prefer **Aucun média** and **Média détecté**. In standalone explanatory labels, **Aucun média affiché** is also approved. Do not force *contenu* into French when *média* is sufficient.
@@ -44,6 +43,6 @@ StageSwap uses clear, natural product language in English, French, and neutral i
 - Use sentence case except for deliberate all-caps preview labels.
 - Address French users with the formal **vous** register.
 - Use direct, informal singular instructions in neutral international Spanish.
-- Prefer familiar outcomes over implementation terms. User-facing copy should not describe the video pipeline, retransmission, recovery machinery, or an idle-reference implementation detail when a clearer task-oriented phrase is available.
+- Describe familiar tasks and outcomes instead of capture, pipeline, or recovery implementation details.
 - Preserve placeholders such as `{0}` and `{1}`, meaningful line breaks, and ellipses that indicate a following dialog.
 - When one English phrase appears in different contexts, give each context its own source key instead of forcing one translation to serve incompatible grammatical roles.

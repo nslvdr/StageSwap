@@ -24,8 +24,7 @@ StageSwap gives Zoom one camera to select: **Stageswap Camera**. In the normal *
 
 - When the screen matches the reference image, Zoom receives the webcam.
 - When the screen changes enough to indicate media, Zoom receives the secondary screen.
-- By default, when a non-reference image stays unchanged, Zoom receives the webcam with the live secondary screen inset. The behavior, direction, delay, and Mini/Medium/Large inset size are configurable.
-- The output selector can also force that picture-in-picture layout immediately.
+- When presentation content stays unchanged, StageSwap can show it as an inset over the webcam. Picture-in-picture is configurable and can also be selected manually.
 - When automatic switching is stopped, Zoom receives a fixed StageSwap off screen.
 
 Transitions are blended, and several consistent comparisons are required before the source changes. The published video is fixed at 1280×720 and 30 fps.
@@ -37,7 +36,7 @@ Transitions are blended, and several consistent comparisons are required before 
 
 StageSwap watches the selected screen visually. Webcam and screen frames stay on the computer: they are not recorded or uploaded. StageSwap does not connect to or control JW Library, read its text or media metadata, transmit audio, or start Zoom screen sharing.
 
-Anything visible on the selected secondary screen can appear in Zoom while **Auto** or **Screen** is active. Always check the **Zoom output** preview before a meeting.
+Anything visible on the selected secondary screen can appear in Zoom, including in picture-in-picture. Always check the **Zoom output** preview before a meeting.
 
 ## Requirements
 
@@ -75,11 +74,11 @@ For screenshots, detailed instructions, and a setup success checklist, follow th
 
 ## Deliberate limits
 
-StageSwap is intentionally focused. It has no audio path, OBS integration, 1080p output, HDR tone mapping, general device hot-plug manager, automatic replacement-device selection, or docking and sleep/resume recovery. Webcam recovery retries the saved webcam; screen recovery retries the saved display. See the [technical reference](https://github.com/NatanSlvdr/StageSwap/wiki/Technical-reference) for the exact contract.
+StageSwap provides video only, at 720p, with no OBS integration or HDR tone mapping. Recovery retries saved devices; it does not automatically choose replacements or handle docking and sleep/resume. See the [technical reference](https://github.com/NatanSlvdr/StageSwap/wiki/Technical-reference) for detailed limits.
 
 ## Development
 
-StageSwap is a Rust 2024 workspace pinned to Rust 1.97.1. Platform-independent components can be built and tested on macOS; native capture, deployment, tray, and virtual-camera behavior require Windows 11 x64.
+StageSwap is written in Rust. Start with the developer guide for the pinned toolchain and validation requirements.
 
 - [Developer guide](docs/DEVELOPMENT.md) — workspace, commands, previews, platform boundaries, and releases
 - [Architecture](docs/ARCHITECTURE.md) — runtime, capture, composition, publishing, recovery, and deployment

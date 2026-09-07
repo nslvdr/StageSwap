@@ -4,7 +4,7 @@ This guide covers local engineering, deterministic UI review, Windows validation
 
 ## Prerequisites and workspace
 
-StageSwap uses Rust edition 2024 and is pinned to Rust 1.97.1 in `rust-toolchain.toml`. The toolchain includes `rustfmt`, Clippy, and the `x86_64-pc-windows-msvc` target.
+Use the pinned toolchain in [`rust-toolchain.toml`](../rust-toolchain.toml), which includes `rustfmt`, Clippy, and the `x86_64-pc-windows-msvc` target. The workspace uses Rust edition 2024.
 
 | Path | Purpose |
 | --- | --- |
@@ -34,6 +34,8 @@ Cross-target linting catches Windows-only compilation issues available to the ho
 cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
 ```
 
+## Test design
+
 Tests use the prefixes `contract_`, `flow_`, `smoke_`, and `native_`. Add coverage for stable contracts, cross-component transitions, deterministic boundaries, migrations, malformed input, and costly failure paths. Prefer extending a focused existing test over adding near-duplicate coverage.
 
 Keep environment-dependent Windows, COM, camera, display, tray, and virtual-camera checks separate from the host-visible suite. UI tests should protect meaningful state, containment, accessibility-relevant behavior, and representative interactions—not exact pixels or exhaustive layout variants.
@@ -46,21 +48,25 @@ Launch the real Settings UI with mock devices, displays, imagery, and healthy ru
 cargo run -p stageswap --bin StageSwap -- --ui-preview
 ```
 
-Open a specific page with `general`, `webcam`, `screen`, `matching`, `updates`, or `diagnostics`:
+General opens by default. Append a preview name to open another state:
+
+| Preview | Names / options |
+| --- | --- |
+| Settings | `general`, `webcam`, `screen`, `matching`, `updates`, `diagnostics` |
+| Version picker | `updates-versions` (mock releases; no download or installer) |
+| Notifications | `notifications`, `notifications-empty`, `notifications-critical`, `notifications-updates` |
+| Guided setup | `setup-1` through `setup-5` |
+| Reference state on `setup-4` | `--ui-setup-reference-state captured`, `empty`, `review`, or `missing-screen` |
+| Dialogs | `dialog-exit`, `dialog-clear-logs`, `dialog-admin`, `dialog-replace-baseline`, `dialog-load-admin-config`, `dialog-remove-baseline` |
+| Language on any preview | `--ui-language en-US`, `fr-FR`, or `es` |
+
+For example:
 
 ```bash
-cargo run -p stageswap --bin StageSwap -- --ui-preview matching
+cargo run -p stageswap --bin StageSwap -- --ui-preview setup-4 --ui-setup-reference-state review --ui-language fr-FR
 ```
 
-Notification previews are `notifications`, `notifications-empty`, `notifications-critical`, and `notifications-updates`. The default `notifications` preview shows the bell with two critical alerts and an update; after 30 seconds of preview activity, it adds an informational activity notification every 30 seconds. The explicit empty, critical, and update previews remain fixed for deterministic state review.
-
-Setup previews are `setup-1` through `setup-5`. The reference step accepts `captured`, `empty`, `review`, or `missing-screen`:
-
-```bash
-cargo run -p stageswap --bin StageSwap -- --ui-preview setup-4 --ui-setup-reference-state review
-```
-
-Dialog previews are `dialog-exit`, `dialog-clear-logs`, `dialog-admin`, `dialog-replace-baseline`, `dialog-load-admin-config`, and `dialog-remove-baseline`. Add `--ui-language en-US`, `--ui-language fr-FR`, or `--ui-language es` to inspect a supported locale.
+The `notifications` preview starts with two critical alerts and an update, then adds an informational notification every 30 seconds of activity. The other notification previews remain fixed.
 
 Preview mode uses temporary configuration and never writes the normal `reference.png`. The setup reference controls modify only in-memory mock frames.
 
@@ -92,4 +98,4 @@ Never use the publisher merely to test a documentation or packaging change: it c
 
 ## Contribution and reporting policy
 
-Pull requests are not currently accepted. Report reproducible problems through [GitHub issues](https://github.com/NatanSlvdr/StageSwap/issues) with the StageSwap and Windows versions, selected device types, reproduction steps, expected and actual behavior, and reviewed diagnostic logs when relevant. Do not attach camera or display frames without checking them for private content.
+See the [README](../README.md#development) for contribution policy. Report reproducible problems through [GitHub issues](https://github.com/NatanSlvdr/StageSwap/issues) with the StageSwap and Windows versions, selected device types, reproduction steps, expected and actual behavior, and reviewed diagnostic logs when relevant. Do not attach camera or display frames without checking them for private content.
