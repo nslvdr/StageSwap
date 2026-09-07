@@ -34,7 +34,6 @@ pub(crate) struct ReleaseVersion {
 }
 
 impl ReleaseVersion {
-    #[cfg(any(windows, test))]
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         let value = value.strip_prefix('v').unwrap_or(value);
         let mut parts = value.split('.');
@@ -113,6 +112,17 @@ pub(crate) fn select_update(
     channel: UpdateChannel,
     current: ReleaseVersion,
 ) -> Result<Option<AvailableUpdate>, String> {
+    Ok(select_versions(json, channel)?
+        .into_iter()
+        .find(|release| release.version > current))
+}
+
+/// Lists installable releases newest first, including rollback candidates.
+#[cfg(any(windows, test))]
+pub(crate) fn select_versions(
+    json: &[u8],
+    channel: UpdateChannel,
+) -> Result<Vec<AvailableUpdate>, String> {
     let releases: Vec<GithubRelease> = serde_json::from_slice(json)
         .map_err(|error| format!("invalid GitHub response: {error}"))?;
     let mut candidates = Vec::new();
@@ -123,7 +133,7 @@ pub(crate) fn select_update(
         let Ok(version) = ReleaseVersion::parse(&release.tag_name) else {
             continue;
         };
-        if release.tag_name != format!("v{version}") || version <= current {
+        if release.tag_name != format!("v{version}") {
             continue;
         }
         let executable_name = format!("{RELEASE_ASSET_PREFIX}{version}.exe");
@@ -155,7 +165,9 @@ pub(crate) fn select_update(
             asset_digest: executable.digest.clone(),
         });
     }
-    Ok(candidates.into_iter().max_by_key(|release| release.version))
+    candidates.sort_by_key(|release| std::cmp::Reverse(release.version));
+    candidates.dedup_by_key(|release| release.version);
+    Ok(candidates)
 }
 
 #[cfg(any(windows, test))]
@@ -179,6 +191,39 @@ pub(crate) enum UpdateStatus {
     Failed(String),
 }
 
+/// Catalog loading is independent of the normal latest-update check.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum VersionCatalog {
+    #[default]
+    Idle,
+    Loading,
+    Ready(Vec<AvailableUpdate>),
+    Failed(String),
+}
+
+/// Deterministic preview releases cannot be downloaded or installed.
+#[cfg(any(not(windows), test))]
+pub(crate) fn preview_versions() -> Vec<AvailableUpdate> {
+    let mut releases = [(1, 0, 4, true), (1, 0, 3, true), (1, 0, 2, false)]
+        .into_iter()
+        .map(|(major, minor, patch, prerelease)| AvailableUpdate {
+            version: ReleaseVersion {
+                major,
+                minor,
+                patch,
+            },
+            prerelease,
+            executable_url: String::new(),
+            checksum_url: String::new(),
+            asset_digest: None,
+        })
+        .collect::<Vec<_>>();
+    let mut current = releases[0].clone();
+    current.version = ReleaseVersion::parse(env!("CARGO_PKG_VERSION")).expect("package version");
+    releases.insert(0, current);
+    releases
+}
+
 #[cfg(windows)]
 #[derive(Debug)]
 pub(crate) enum UpdateRequest {
@@ -186,6 +231,7 @@ pub(crate) enum UpdateRequest {
         channel: UpdateChannel,
         manual: bool,
     },
+    ListVersions,
     Install(AvailableUpdate),
 }
 
@@ -196,6 +242,7 @@ pub(crate) enum UpdateResult {
         manual: bool,
         result: Result<Option<AvailableUpdate>, String>,
     },
+    Versions(Result<Vec<AvailableUpdate>, String>),
     InstallStarted,
     InstallFailed(String),
 }
@@ -222,6 +269,14 @@ impl UpdateWorker {
                                 .send(UpdateResult::Checked { manual, result })
                                 .is_err()
                             {
+                                break;
+                            }
+                        }
+                        UpdateRequest::ListVersions => {
+                            let result =
+                                stageswap_windows::https_get(RELEASES_API, MAX_RELEASES_JSON)
+                                    .and_then(|json| select_versions(&json, UpdateChannel::Beta));
+                            if results.send(UpdateResult::Versions(result)).is_err() {
                                 break;
                             }
                         }
@@ -474,6 +529,33 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn contract_version_picker_includes_rollback_candidates_and_filters_invalid_assets() {
+        let mut releases: serde_json::Value = serde_json::from_slice(&releases_json()).unwrap();
+        let valid = select_versions(&releases_json(), UpdateChannel::Beta).unwrap();
+        assert_eq!(
+            valid
+                .iter()
+                .map(|r| r.version.to_string())
+                .collect::<Vec<_>>(),
+            ["2.0.0", "1.9.0"]
+        );
+        assert_eq!(
+            select_versions(&releases_json(), UpdateChannel::Stable)
+                .unwrap()
+                .len(),
+            1
+        );
+        releases[0]["assets"][0]["browser_download_url"] = "http://github.com/unsafe".into();
+        releases[1]["assets"].as_array_mut().unwrap().pop();
+        assert!(
+            select_versions(&serde_json::to_vec(&releases).unwrap(), UpdateChannel::Beta)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(select_versions(b"invalid", UpdateChannel::Beta).is_err());
     }
 
     #[test]

@@ -86,7 +86,7 @@ The executable embeds the x64 Media Foundation source DLL. First managed or run-
 
 An account-scoped, owner-only control pipe lets duplicate launches show that account's existing dashboard and lets an approved replacement request graceful shutdown without contacting another signed-in user. Replacement stages and verifies the candidate, waits up to ten seconds without force-termination, retains the previous executable until the new instance reports ready, and rolls back startup failure.
 
-The Updates page checks the public GitHub Releases API once at startup and on demand. Stable ignores prereleases; Beta accepts both tracks. Downloads never start automatically. User-approved candidates are bounded, staged locally, and accepted only when release metadata, the versioned filename, the SHA-256 sidecar, and any GitHub digest agree. Installation reuses the replacement and rollback transaction.
+The Updates page checks the public GitHub Releases API once at startup and on demand. Stable ignores prereleases; Beta accepts both tracks and exposes an Install a specific version button below the main update action, opening a modal version picker for manual rollback. Its loading, error/retry, empty-list, and selected-version states are independent of the latest-update offer; cancelling preserves that offer. The picker lists installable versions from the latest 100 published releases returned by GitHub, newest first, and disables the running version. Choosing a version does not download it; the user must explicitly select a version and click Install this version. The channel and picker are disabled while a check or installation is in progress. Downloads never start automatically. User-approved candidates are bounded, staged locally, and accepted only when release metadata, the versioned filename, the SHA-256 sidecar, and any GitHub digest agree. Installation reuses the replacement and rollback transaction.
 
 `--uninstall` removes the current user's startup entry, virtual-camera registration, managed executable, and shortcuts without removing the shared machine source used by other profiles. The explicit administrative `--cleanup` path additionally removes the machine-wide source registration and payloads. Both preserve user data and never modify Automatic Screen Camera resources.
 
@@ -114,3 +114,5 @@ StageSwap does not implement:
 - dynamic output formats, 1080p, audio, OBS integration, or a kernel driver.
 
 These exclusions are product boundaries, not undocumented fallback behavior. Webcam and screen recovery retry only their stored identities.
+
+The deterministic version-picker preview is available with `cargo run -p stageswap --bin StageSwap -- --ui-preview updates-versions --ui-language fr-FR`. It uses mock releases and never downloads or launches an installer.

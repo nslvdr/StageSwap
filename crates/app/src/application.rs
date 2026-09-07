@@ -521,6 +521,7 @@ struct UiPreviewRequest {
 #[cfg(not(windows))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UiPreviewTarget {
+    UpdateVersions,
     Settings(SettingsTab),
     Setup(SetupStep),
     Dialog(AppDialogKind),
@@ -586,6 +587,7 @@ fn parse_ui_preview_request(args: &[String]) -> Result<Option<UiPreviewRequest>,
     };
     ui_preview_locale(args)?;
     let target = match args.get(preview_index + 1).map(String::as_str) {
+        Some("updates-versions") => UiPreviewTarget::UpdateVersions,
         Some("dialog-exit") => UiPreviewTarget::Dialog(AppDialogKind::Exit),
         Some("dialog-clear-logs") => UiPreviewTarget::Dialog(AppDialogKind::ClearLogs),
         Some("dialog-admin") => UiPreviewTarget::Dialog(AppDialogKind::Admin),
@@ -1194,6 +1196,9 @@ struct SwitcherApp {
     notifications: NotificationCenter,
     notification_center_open: bool,
     update_status: UpdateStatus,
+    update_versions: update::VersionCatalog,
+    selected_update_version: Option<update::ReleaseVersion>,
+    update_version_picker_open: bool,
     #[cfg(windows)]
     update_notifications: UpdateNotificationState,
     update_check_started: bool,
@@ -1299,6 +1304,9 @@ impl SwitcherApp {
             notifications,
             notification_center_open: false,
             update_status: UpdateStatus::Idle,
+            update_versions: update::VersionCatalog::Idle,
+            selected_update_version: None,
+            update_version_picker_open: false,
             #[cfg(windows)]
             update_notifications,
             update_check_started: false,
@@ -1402,16 +1410,24 @@ impl SwitcherApp {
         let preview_now = Instant::now();
         let periodic_notifications = !matches!(
             request.target,
-            UiPreviewTarget::Notifications(
-                NotificationPreviewState::Empty
-                    | NotificationPreviewState::Critical
-                    | NotificationPreviewState::Updates
-            )
+            UiPreviewTarget::UpdateVersions
+                | UiPreviewTarget::Notifications(
+                    NotificationPreviewState::Empty
+                        | NotificationPreviewState::Critical
+                        | NotificationPreviewState::Updates
+                )
         );
         if periodic_notifications {
             self.seed_ui_preview_notifications(preview_now);
         }
         match request.target {
+            UiPreviewTarget::UpdateVersions => {
+                self.view = AppView::Settings;
+                self.settings_tab = SettingsTab::Updates;
+                self.config.update_channel = UpdateChannel::Beta;
+                self.update_version_picker_open = true;
+                self.update_versions = update::VersionCatalog::Ready(update::preview_versions());
+            }
             UiPreviewTarget::Settings(tab) => {
                 self.view = AppView::Settings;
                 self.settings_tab = tab;
@@ -1787,10 +1803,7 @@ impl SwitcherApp {
     }
 
     fn request_update_check(&mut self, manual: bool) {
-        if matches!(
-            self.update_status,
-            UpdateStatus::Checking | UpdateStatus::Downloading(_) | UpdateStatus::Installing
-        ) {
+        if self.update_busy() {
             return;
         }
         #[cfg(windows)]
@@ -1819,6 +1832,62 @@ impl SwitcherApp {
             let _ = manual;
             self.update_status = UpdateStatus::UpToDate;
         }
+    }
+
+    fn update_busy(&self) -> bool {
+        matches!(
+            self.update_status,
+            UpdateStatus::Checking | UpdateStatus::Downloading(_) | UpdateStatus::Installing
+        ) || matches!(self.update_versions, update::VersionCatalog::Loading)
+    }
+
+    /// Fetching or cancelling the picker never changes the latest-update offer.
+    fn request_update_versions(&mut self) {
+        if self.config.update_channel != UpdateChannel::Beta || self.update_busy() {
+            return;
+        }
+        self.selected_update_version = None;
+        self.update_version_picker_open = true;
+        self.update_versions = update::VersionCatalog::Loading;
+        #[cfg(not(windows))]
+        if self.ui_preview.is_some() {
+            self.update_versions = update::VersionCatalog::Ready(update::preview_versions());
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let result = self
+                .update_worker
+                .as_ref()
+                .ok_or_else(|| "The update service is unavailable.".to_owned())
+                .and_then(|worker| worker.request(UpdateRequest::ListVersions));
+            if let Err(error) = result {
+                self.update_versions = update::VersionCatalog::Failed(error);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            self.update_versions = update::VersionCatalog::Failed(
+                "Version downloads are available on Windows only.".into(),
+            );
+        }
+    }
+
+    /// Only an explicit catalog selection can be installed; the running version is excluded.
+    fn selected_version_release(&self) -> Option<update::AvailableUpdate> {
+        if self.config.update_channel != UpdateChannel::Beta || self.update_busy() {
+            return None;
+        }
+        let update::VersionCatalog::Ready(versions) = &self.update_versions else {
+            return None;
+        };
+        versions
+            .iter()
+            .find(|release| {
+                Some(release.version) == self.selected_update_version
+                    && release.version.to_string() != env!("CARGO_PKG_VERSION")
+            })
+            .cloned()
     }
 
     #[cfg(windows)]
@@ -1879,6 +1948,12 @@ impl SwitcherApp {
                     self.update_status = UpdateStatus::Idle;
                 }
             },
+            UpdateResult::Versions(result) => {
+                self.update_versions = match result {
+                    Ok(releases) => update::VersionCatalog::Ready(releases),
+                    Err(error) => update::VersionCatalog::Failed(error),
+                };
+            }
             UpdateResult::InstallFailed(error) => {
                 self.log
                     .write("error", "update", "UPDATE_INSTALL_FAILED", &error);
@@ -1892,7 +1967,19 @@ impl SwitcherApp {
         let UpdateStatus::Available(release) = &self.update_status else {
             return;
         };
-        let release = release.clone();
+        self.install_release(release.clone());
+    }
+
+    /// Both entry points share verification and native replacement.
+    fn install_release(&mut self, release: update::AvailableUpdate) {
+        if self.update_busy() {
+            return;
+        }
+        #[cfg(not(windows))]
+        if self.ui_preview.is_some() {
+            self.update_status = UpdateStatus::Downloading(release);
+            return;
+        }
         #[cfg(windows)]
         {
             let Some(worker) = self.update_worker.as_ref() else {
@@ -2350,6 +2437,7 @@ impl SwitcherApp {
             })
             .inner;
         self.dialog(&context);
+        self.update_version_picker(&context);
         self.notification_overlay(&context);
         self.paint_disco_interface(&context, content_rect, disco_enabled);
         self.render_snapshot = None;
@@ -4539,10 +4627,7 @@ impl SwitcherApp {
         settings_current_version_card(ui, &status, &self.update_status);
         ui.add_space(12.0);
 
-        let busy = matches!(
-            self.update_status,
-            UpdateStatus::Checking | UpdateStatus::Downloading(_) | UpdateStatus::Installing
-        );
+        let busy = self.update_busy();
         let update_available = matches!(self.update_status, UpdateStatus::Available(_));
         let (action_icon, action_label) = if update_available {
             (UiIcon::Download, "Install update")
@@ -4570,6 +4655,25 @@ impl SwitcherApp {
             }
         }
 
+        if self.config.update_channel == UpdateChannel::Beta {
+            ui.add_space(8.0);
+            let choose = ui
+                .add_enabled_ui(!busy, |ui| {
+                    icon_button(
+                        ui,
+                        UiIcon::Download,
+                        "Install a specific version",
+                        egui::vec2(action_width, 38.0),
+                        false,
+                        true,
+                    )
+                })
+                .inner;
+            if choose.clicked() {
+                self.request_update_versions();
+            }
+        }
+
         ui.add_space(18.0);
 
         settings_section_heading(
@@ -4587,18 +4691,20 @@ impl SwitcherApp {
             "Stable releases are recommended. Beta may include unfinished changes.",
             166.0,
             |ui| {
-                egui::ComboBox::from_id_salt("update-channel")
-                    .width(166.0)
-                    .selected_text(update_channel_label(self.config.update_channel, locale))
-                    .show_ui(ui, |ui| {
-                        for channel in [UpdateChannel::Stable, UpdateChannel::Beta] {
-                            ui.selectable_value(
-                                &mut self.config.update_channel,
-                                channel,
-                                update_channel_label(channel, locale),
-                            );
-                        }
-                    });
+                ui.add_enabled_ui(!busy, |ui| {
+                    egui::ComboBox::from_id_salt("update-channel")
+                        .width(166.0)
+                        .selected_text(update_channel_label(self.config.update_channel, locale))
+                        .show_ui(ui, |ui| {
+                            for channel in [UpdateChannel::Stable, UpdateChannel::Beta] {
+                                ui.selectable_value(
+                                    &mut self.config.update_channel,
+                                    channel,
+                                    update_channel_label(channel, locale),
+                                );
+                            }
+                        });
+                });
             },
         );
         settings_toggle_row(
@@ -4608,8 +4714,163 @@ impl SwitcherApp {
             "Show one notification for each new version on the selected channel.",
         );
         if self.config.update_channel != previous_channel {
+            self.update_versions = update::VersionCatalog::Idle;
+            self.selected_update_version = None;
+            self.update_version_picker_open = false;
             self.update_status = UpdateStatus::Idle;
             self.request_update_check(false);
+        }
+    }
+
+    /// Uses the same modal surface and action buttons as the other application dialogs.
+    fn update_version_picker(&mut self, context: &egui::Context) {
+        if !self.update_version_picker_open {
+            return;
+        }
+        let locale = self.locale();
+        let mut retry = false;
+        let mut cancel = false;
+        let mut install = false;
+        let response = egui::Modal::new(egui::Id::new("update-version-picker"))
+            .frame(
+                egui::Frame::new()
+                    .fill(ui_theme::SURFACE_DEEP)
+                    .stroke(Stroke::new(1.0, ui_theme::BORDER_SUBTLE))
+                    .corner_radius(12)
+                    .inner_margin(24)
+                    .shadow(egui::Shadow {
+                        offset: [0, 8],
+                        blur: 28,
+                        spread: 2,
+                        color: Color32::from_black_alpha(150),
+                    }),
+            )
+            .backdrop_color(Color32::from_black_alpha(145))
+            .show(context, |ui| {
+                ui.set_width(480.0_f32.min((context.content_rect().width() - 80.0).max(240.0)));
+                ui.label(
+                    RichText::new(tr(ui, "Install a specific version"))
+                        .size(19.0)
+                        .strong(),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format_text(
+                        locale,
+                        "Current version: {0}",
+                        &[env!("CARGO_PKG_VERSION")],
+                    ))
+                    .size(12.0)
+                    .color(ui_theme::TEXT_SUBTLE),
+                );
+                ui.add_space(8.0);
+                ui.label(tr(
+                    ui,
+                    "Select a release. Installation starts only after you confirm below.",
+                ));
+                ui.add_space(16.0);
+                match &self.update_versions {
+                    update::VersionCatalog::Loading | update::VersionCatalog::Idle => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(tr(ui, "Loading versions…"));
+                        });
+                    }
+                    update::VersionCatalog::Failed(error) => {
+                        ui.label(RichText::new(tr(ui, "Could not load versions.")).color(LIVE_RED));
+                        ui.collapsing(tr(ui, "Details"), |ui| {
+                            ui.label(error);
+                        });
+                        retry = ui.button(tr(ui, "Retry")).clicked();
+                    }
+                    update::VersionCatalog::Ready(versions) if versions.is_empty() => {
+                        ui.label(tr(ui, "No installable versions found."));
+                        retry = ui.button(tr(ui, "Retry")).clicked();
+                    }
+                    update::VersionCatalog::Ready(versions) => {
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                for release in versions {
+                                    let current =
+                                        release.version.to_string() == env!("CARGO_PKG_VERSION");
+                                    let track = update_channel_label(
+                                        if release.prerelease {
+                                            UpdateChannel::Beta
+                                        } else {
+                                            UpdateChannel::Stable
+                                        },
+                                        locale,
+                                    );
+                                    let mut label = format!("{}  ·  {track}", release.version);
+                                    if current {
+                                        label.push_str(&format!("  ·  {}", tr(ui, "Installed")));
+                                    }
+                                    ui.add_enabled_ui(!current, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.selected_update_version,
+                                            Some(release.version),
+                                            label,
+                                        );
+                                    });
+                                }
+                            });
+                    }
+                }
+                let selected = self.selected_version_release();
+                ui.add_space(16.0);
+                if let Some(release) = &selected {
+                    ui.label(format_text(
+                        locale,
+                        "StageSwap {0} will be installed and the app will restart.",
+                        &[&release.version.to_string()],
+                    ));
+                } else {
+                    ui.label(
+                        RichText::new(tr(ui, "Choose a version to enable installation."))
+                            .size(12.0)
+                            .color(ui_theme::TEXT_SUBTLE),
+                    );
+                }
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(12.0);
+                let width = dialog_action_width(ui.available_width(), 8.0, 2);
+                ui.horizontal(|ui| {
+                    cancel = dialog_button(
+                        ui,
+                        UiIcon::Back,
+                        "Cancel",
+                        DialogButtonTone::Secondary,
+                        width,
+                    )
+                    .clicked();
+                    install = ui
+                        .add_enabled_ui(selected.is_some(), |ui| {
+                            dialog_button(
+                                ui,
+                                UiIcon::Download,
+                                "Install this version",
+                                DialogButtonTone::Primary,
+                                width,
+                            )
+                        })
+                        .inner
+                        .clicked();
+                });
+            });
+        if cancel || response.should_close() {
+            self.update_version_picker_open = false;
+            self.selected_update_version = None;
+        } else if install {
+            if let Some(release) = self.selected_version_release() {
+                self.update_version_picker_open = false;
+                self.selected_update_version = None;
+                self.install_release(release);
+            }
+        } else if retry {
+            self.request_update_versions();
         }
     }
 
@@ -10796,6 +11057,64 @@ mod tests {
             app.setup_reference_capture,
             SetupReferenceCaptureState::Confirmed
         ));
+    }
+
+    #[test]
+    fn flow_version_picker_keeps_latest_offer_and_requires_an_explicit_installable_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = SwitcherApp::new(
+            AppConfig {
+                update_channel: UpdateChannel::Beta,
+                ..AppConfig::default()
+            },
+            Vec::new(),
+            ConfigStore::new(directory.path()),
+        );
+        let releases = update::preview_versions();
+        let latest = releases[0].clone();
+        let older = releases[1].clone();
+        app.update_status = UpdateStatus::Available(latest.clone());
+        app.update_versions = update::VersionCatalog::Ready(releases);
+        assert!(app.selected_version_release().is_none());
+        app.selected_update_version = Some(older.version);
+        assert_eq!(app.selected_version_release(), Some(older.clone()));
+        assert_eq!(app.update_status, UpdateStatus::Available(latest.clone()));
+        app.update_version_picker_open = true;
+        let context = egui::Context::default();
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            app.update_version_picker(ui.ctx())
+        });
+        let _ = context.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                }],
+                ..egui::RawInput::default()
+            },
+            |ui| app.update_version_picker(ui.ctx()),
+        );
+        assert!(!app.update_version_picker_open);
+        assert!(app.selected_update_version.is_none());
+        assert_eq!(app.update_status, UpdateStatus::Available(latest));
+
+        let mut current = older.clone();
+        current.version = update::ReleaseVersion::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        app.selected_update_version = Some(current.version);
+        app.update_versions = update::VersionCatalog::Ready(vec![current]);
+        assert!(app.selected_version_release().is_none());
+        app.selected_update_version = Some(older.version);
+        app.update_versions = update::VersionCatalog::Failed("offline".into());
+        assert!(app.selected_version_release().is_none());
+        app.update_versions = update::VersionCatalog::Loading;
+        assert!(app.update_busy());
+        assert!(app.selected_version_release().is_none());
+        app.update_versions = update::VersionCatalog::Ready(vec![older]);
+        app.config.update_channel = UpdateChannel::Stable;
+        assert!(app.selected_version_release().is_none());
     }
 
     #[test]
