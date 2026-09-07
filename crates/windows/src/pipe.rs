@@ -137,6 +137,22 @@ impl FramePublisher {
         }
     }
 
+    /// Keeps a healthy publisher, or releases a failed server before reopening its pipe.
+    pub fn ensure_running(publisher: &mut Option<Self>, pipe_name: &str) -> Result<(), String> {
+        if publisher.as_ref().is_some_and(|publisher| {
+            publisher.sink().check_worker().is_ok()
+                && publisher
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| !worker.is_finished())
+        }) {
+            return Ok(());
+        }
+        *publisher = None;
+        *publisher = Some(Self::start(pipe_name)?);
+        Ok(())
+    }
+
     pub fn publish(&self, frame: &Frame) -> Result<(), String> {
         self.sink().publish(frame)
     }
@@ -459,6 +475,37 @@ mod tests {
     use super::*;
     use stageswap_core::Size;
     use std::time::Instant;
+
+    #[test]
+    fn native_failed_publisher_is_replaced_and_healthy_publisher_is_retained() {
+        let name = format!(
+            r"\\.\pipe\StageSwap.RecoverPublisher.{}",
+            std::process::id()
+        );
+        let mut publisher = None;
+        FramePublisher::ensure_running(&mut publisher, &name).unwrap();
+        let first = publisher.as_ref().unwrap().sink();
+        FramePublisher::ensure_running(&mut publisher, &name).unwrap();
+        assert!(Arc::ptr_eq(
+            &first.shared,
+            &publisher.as_ref().unwrap().shared
+        ));
+        *first.shared.failure.lock().unwrap() = Some("injected publisher failure".into());
+        FramePublisher::ensure_running(&mut publisher, &name).unwrap();
+        assert!(!Arc::ptr_eq(
+            &first.shared,
+            &publisher.as_ref().unwrap().shared
+        ));
+        let frame = Frame::placeholder(
+            stageswap_core::PIPELINE_SIZE,
+            0xff00_0000,
+            1,
+            0,
+            Instant::now(),
+        );
+        assert!(first.publish(&frame).is_err());
+        publisher.as_ref().unwrap().publish(&frame).unwrap();
+    }
 
     #[test]
     fn native_duplicate_pipe_publisher_is_rejected_during_startup() {

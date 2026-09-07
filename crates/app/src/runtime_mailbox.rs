@@ -29,6 +29,8 @@ impl CoalescedCommands {
     fn replace(&mut self, command: Command) -> bool {
         match command {
             command @ (Command::UpdateSettings(_) | Command::ReloadSettings(_)) => {
+                // Settings include the output mode and supersede an older mode command.
+                self.output_mode = None;
                 self.settings.replace(command).is_some()
             }
             command @ Command::SetMode(_) => self.output_mode.replace(command).is_some(),
@@ -239,6 +241,23 @@ mod tests {
         assert_eq!(
             inbox.try_recv(),
             Some(Command::SetMode(OutputMode::ForceScreen))
+        );
+    }
+
+    #[test]
+    fn flow_settings_and_modes_preserve_the_latest_output_intent() {
+        let (mailbox, inbox) = CommandMailbox::bounded(1);
+        mailbox.dispatch(Command::SetMode(OutputMode::ForceScreen));
+        mailbox.dispatch(Command::ReloadSettings(Box::default()));
+        assert!(matches!(inbox.try_recv(), Some(Command::ReloadSettings(_))));
+        assert_eq!(inbox.try_recv(), None);
+
+        mailbox.dispatch(Command::UpdateSettings(Box::default()));
+        mailbox.dispatch(Command::SetMode(OutputMode::ForceCamera));
+        assert!(matches!(inbox.try_recv(), Some(Command::UpdateSettings(_))));
+        assert_eq!(
+            inbox.try_recv(),
+            Some(Command::SetMode(OutputMode::ForceCamera))
         );
     }
 

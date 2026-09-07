@@ -304,7 +304,7 @@ fn copy_bgra_rows(
     scanline0_offset: usize,
     stride: i32,
     size: Size,
-    destination: &mut Vec<u8>,
+    destination: &mut [u8],
 ) -> Result<(), String> {
     let row_bytes = usize::try_from(size.width)
         .ok()
@@ -318,7 +318,9 @@ fn copy_bgra_rows(
             "webcam stride {stride} is shorter than the {row_bytes}-byte RGB32 row"
         ));
     }
-    destination.resize(destination_length, 0);
+    if destination.len() != destination_length {
+        return Err("webcam destination has an invalid length".into());
+    }
     for row in 0..size.height as usize {
         let source_offset = (scanline0_offset as i128)
             .checked_add((row as i128) * i128::from(stride))
@@ -599,6 +601,19 @@ unsafe impl Send for CaptureState {}
 unsafe impl Sync for CaptureState {}
 
 impl CaptureState {
+    /// A replacement owns independent callback state; late callbacks can only
+    /// modify the retired session. Preserve user settings and diagnostic counters.
+    fn next_capture(&self) -> Self {
+        Self {
+            crop_to_16_9: AtomicBool::new(self.crop_to_16_9.load(Ordering::Acquire)),
+            generation: AtomicU64::new(self.generation.load(Ordering::Acquire)),
+            sequence: AtomicU64::new(self.sequence.load(Ordering::Acquire)),
+            dropped_frames: AtomicU64::new(self.dropped_frames.load(Ordering::Acquire)),
+            pool_fallbacks: AtomicU64::new(self.pool_fallbacks.load(Ordering::Acquire)),
+            ..Self::default()
+        }
+    }
+
     fn is_current(&self, expected_generation: u64) -> bool {
         self.running.load(Ordering::Acquire)
             && self.generation.load(Ordering::Acquire) == expected_generation
@@ -664,6 +679,58 @@ impl CaptureState {
         if let Ok(mut failure) = self.failure.lock() {
             *failure = None;
         }
+    }
+
+    /// Normalizes locked row-aware input, copying native 720p directly into the pool.
+    fn normalize_sample(
+        &self,
+        source: &[u8],
+        offset: usize,
+        stride: i32,
+        size: Size,
+    ) -> Result<Arc<[u8]>, String> {
+        let aspect_ratio = *self
+            .native_display_aspect_ratio
+            .lock()
+            .map_err(|_| "webcam aspect-ratio state is poisoned")?;
+        let fill = should_aspect_fill(self.crop_to_16_9.load(Ordering::Acquire), aspect_ratio);
+        let mut pool = self
+            .pool
+            .lock()
+            .map_err(|_| "webcam frame pool is poisoned")?;
+        let previous_exhaustions = pool.exhaustion_count();
+        let pixels = pool.write_with_fallback(|destination| {
+            if size == PIPELINE_SIZE && !fill {
+                return copy_bgra_rows(source, offset, stride, size, destination);
+            }
+            let mut tight = self
+                .scratch
+                .lock()
+                .map_err(|_| "webcam row-copy state is poisoned")?;
+            let length = (size.width as usize)
+                .checked_mul(size.height as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or("webcam frame size overflowed")?;
+            tight.resize(length, 0);
+            copy_bgra_rows(source, offset, stride, size, &mut tight)?;
+            let result = if fill {
+                aspect_fill_bgra_into(
+                    &tight,
+                    size,
+                    size.width * 4,
+                    aspect_ratio.expect("aspect fill requires a known ratio"),
+                    destination,
+                    PIPELINE_SIZE,
+                )
+            } else {
+                aspect_fit_bgra_into(&tight, size, size.width * 4, destination, PIPELINE_SIZE)
+            };
+            result.map_err(|error| format!("could not normalize webcam frame: {error:?}"))
+        })?;
+        if pool.exhaustion_count() > previous_exhaustions {
+            self.pool_fallbacks.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(pixels)
     }
 
     fn update_current_format(&self) -> Result<NegotiatedFormat, String> {
@@ -797,133 +864,78 @@ impl IMFSourceReaderCallback_Impl for ReaderCallback_Impl {
                     .lock()
                     .map_or(PIPELINE_SIZE, |format| *format);
                 let stride = self.state.stride.load(Ordering::Acquire);
-                let copy_result = self
-                    .state
-                    .scratch
-                    .lock()
-                    .map_err(|_| "webcam row-copy state is poisoned".to_owned())
-                    .and_then(|mut tight| {
-                        if let Ok(buffer_2d) = buffer.cast::<IMF2DBuffer2>() {
-                            let mut scanline = core::ptr::null_mut();
-                            let mut pitch = 0;
-                            let mut buffer_start = core::ptr::null_mut();
-                            let mut buffer_length = 0;
-                            // SAFETY: all output pointers are writable and Unlock2D balances a
-                            // successful lock before the callback returns.
-                            unsafe {
-                                buffer_2d.Lock2DSize(
-                                    MF2DBuffer_LockFlags_Read,
-                                    &mut scanline,
-                                    &mut pitch,
-                                    &mut buffer_start,
-                                    &mut buffer_length,
-                                )
-                            }
-                            .map_err(|error| format!("could not lock webcam 2D buffer: {error}"))?;
-                            // SAFETY: Lock2DSize returns pointers into the same locked allocation.
-                            let offset = unsafe { scanline.offset_from(buffer_start) };
-                            let result = if offset < 0 {
-                                Err("webcam scanline starts before its 2D buffer".into())
-                            } else {
-                                // SAFETY: buffer_start addresses buffer_length locked bytes.
-                                let source = unsafe {
-                                    core::slice::from_raw_parts(
-                                        buffer_start,
-                                        buffer_length as usize,
-                                    )
-                                };
-                                copy_bgra_rows(source, offset as usize, pitch, size, &mut tight)
-                            };
-                            // SAFETY: balances the successful Lock2DSize call above.
-                            let _ = unsafe { buffer_2d.Unlock2D() };
-                            result?;
+                let copy_result = (|| {
+                    let pixels = if let Ok(buffer_2d) = buffer.cast::<IMF2DBuffer2>() {
+                        let mut scanline = core::ptr::null_mut();
+                        let mut pitch = 0;
+                        let mut buffer_start = core::ptr::null_mut();
+                        let mut buffer_length = 0;
+                        // SAFETY: all output pointers are writable and Unlock2D balances a
+                        // successful lock before the callback returns.
+                        unsafe {
+                            buffer_2d.Lock2DSize(
+                                MF2DBuffer_LockFlags_Read,
+                                &mut scanline,
+                                &mut pitch,
+                                &mut buffer_start,
+                                &mut buffer_length,
+                            )
+                        }
+                        .map_err(|error| format!("could not lock webcam 2D buffer: {error}"))?;
+                        // SAFETY: Lock2DSize returns pointers into the same locked allocation.
+                        let offset = unsafe { scanline.offset_from(buffer_start) };
+                        let result = if offset < 0 {
+                            Err("webcam scanline starts before its 2D buffer".into())
                         } else {
-                            if stride < 0 {
-                                return Err(
-                                    "negative webcam stride requires IMF2DBuffer2 access".into()
-                                );
-                            }
-                            let mut bytes = core::ptr::null_mut();
-                            let mut length = 0;
-                            // SAFETY: all output pointers are writable; Unlock balances Lock.
-                            unsafe { buffer.Lock(&mut bytes, None, Some(&mut length)) }.map_err(
-                                |error| format!("could not lock webcam buffer: {error}"),
-                            )?;
-                            // SAFETY: Lock returned length readable bytes at bytes.
-                            let source =
-                                unsafe { core::slice::from_raw_parts(bytes, length as usize) };
-                            let result = copy_bgra_rows(source, 0, stride, size, &mut tight);
-                            // SAFETY: balances the successful Lock call above.
-                            let _ = unsafe { buffer.Unlock() };
-                            result?;
-                        }
-                        let pixels = {
-                            let mut pool = self
-                                .state
-                                .pool
-                                .lock()
-                                .map_err(|_| "webcam frame pool is poisoned".to_owned())?;
-                            let previous_exhaustions = pool.exhaustion_count();
-                            let crop_to_16_9 = self.state.crop_to_16_9.load(Ordering::Acquire);
-                            let display_aspect_ratio = self
-                                .state
-                                .native_display_aspect_ratio
-                                .lock()
-                                .ok()
-                                .and_then(|ratio| *ratio);
-                            let use_aspect_fill =
-                                should_aspect_fill(crop_to_16_9, display_aspect_ratio);
-                            let pixels = pool
-                                .write_with_fallback(|destination| {
-                                    if use_aspect_fill {
-                                        aspect_fill_bgra_into(
-                                            &tight,
-                                            size,
-                                            size.width * 4,
-                                            display_aspect_ratio
-                                                .expect("aspect fill requires a known ratio"),
-                                            destination,
-                                            PIPELINE_SIZE,
-                                        )
-                                    } else {
-                                        aspect_fit_bgra_into(
-                                            &tight,
-                                            size,
-                                            size.width * 4,
-                                            destination,
-                                            PIPELINE_SIZE,
-                                        )
-                                    }
-                                })
-                                .map_err(|error| {
-                                    format!("could not normalize webcam frame: {error:?}")
-                                })?;
-                            if pool.exhaustion_count() > previous_exhaustions {
-                                self.state.pool_fallbacks.fetch_add(1, Ordering::Relaxed);
-                            }
-                            pixels
+                            // SAFETY: buffer_start addresses buffer_length locked bytes.
+                            let source = unsafe {
+                                core::slice::from_raw_parts(buffer_start, buffer_length as usize)
+                            };
+                            self.state
+                                .normalize_sample(source, offset as usize, pitch, size)
                         };
-                        let sequence = self.state.sequence.fetch_add(1, Ordering::Relaxed) + 1;
-                        let frame = Frame::new(
-                            pixels,
-                            PIPELINE_SIZE,
-                            PIPELINE_SIZE.width * 4,
-                            sequence,
-                            timestamp,
-                            now,
-                        )
-                        .map_err(|error| format!("invalid webcam frame: {error:?}"))?;
-                        if self.state.is_current(self.expected_generation) {
-                            *self
-                                .state
-                                .latest
-                                .lock()
-                                .map_err(|_| "webcam frame state is poisoned".to_owned())? =
-                                Some(Arc::new(frame));
-                            self.state.clear_failure();
+                        // SAFETY: balances the successful Lock2DSize call above.
+                        let _ = unsafe { buffer_2d.Unlock2D() };
+                        result?
+                    } else {
+                        if stride < 0 {
+                            return Err(
+                                "negative webcam stride requires IMF2DBuffer2 access".into()
+                            );
                         }
-                        Ok(())
-                    });
+                        let mut bytes = core::ptr::null_mut();
+                        let mut length = 0;
+                        // SAFETY: all output pointers are writable; Unlock balances Lock.
+                        unsafe { buffer.Lock(&mut bytes, None, Some(&mut length)) }
+                            .map_err(|error| format!("could not lock webcam buffer: {error}"))?;
+                        // SAFETY: Lock returned length readable bytes at bytes.
+                        let source = unsafe { core::slice::from_raw_parts(bytes, length as usize) };
+                        let result = self.state.normalize_sample(source, 0, stride, size);
+                        // SAFETY: balances the successful Lock call above.
+                        let _ = unsafe { buffer.Unlock() };
+                        result?
+                    };
+                    let sequence = self.state.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+                    let frame = Frame::new(
+                        pixels,
+                        PIPELINE_SIZE,
+                        PIPELINE_SIZE.width * 4,
+                        sequence,
+                        timestamp,
+                        now,
+                    )
+                    .map_err(|error| format!("invalid webcam frame: {error:?}"))?;
+                    if self.state.is_current(self.expected_generation) {
+                        *self
+                            .state
+                            .latest
+                            .lock()
+                            .map_err(|_| "webcam frame state is poisoned".to_owned())? =
+                            Some(Arc::new(frame));
+                        self.state.clear_failure();
+                    }
+                    Ok::<(), String>(())
+                })();
                 if let Err(error) = copy_result {
                     self.state.dropped_frames.fetch_add(1, Ordering::Relaxed);
                     self.state.set_failure(
@@ -1018,6 +1030,7 @@ impl VideoInput for MediaFoundationVideoInput {
             return Err("video source identifier is empty".into());
         }
         self.stop();
+        self.state = Arc::new(self.state.next_capture());
         let mut source_attributes = None;
         let mut reader_attributes = None;
         (|| -> windows_core::Result<()> {
@@ -1136,6 +1149,9 @@ impl VideoInput for MediaFoundationVideoInput {
     }
 
     fn latest_frame(&self) -> Option<Arc<Frame>> {
+        if !self.state.running.load(Ordering::Acquire) {
+            return None;
+        }
         self.state
             .latest
             .lock()
@@ -1241,7 +1257,7 @@ mod format_tests {
         padded.extend_from_slice(&[0; 4]);
         padded.extend_from_slice(&bottom);
         padded.extend_from_slice(&[0; 4]);
-        let mut destination = Vec::new();
+        let mut destination = vec![0; 16];
         copy_bgra_rows(&padded, 0, 12, size, &mut destination).unwrap();
         assert_eq!(destination, [top, bottom].concat());
 
@@ -1257,7 +1273,7 @@ mod format_tests {
     #[test]
     fn native_row_copy_rejects_an_undersized_buffer() {
         let size = Size::new(2, 2);
-        let mut destination = Vec::new();
+        let mut destination = vec![0; 16];
         let error = copy_bgra_rows(&[0; 20], 0, 12, size, &mut destination).unwrap_err();
         assert!(error.contains("too short"));
     }
@@ -1358,6 +1374,81 @@ mod tests {
         assert!(state.is_current(generation));
         state.generation.fetch_add(1, Ordering::AcqRel);
         assert!(!state.is_current(generation));
+    }
+
+    #[test]
+    fn native_retired_callback_cannot_fail_a_replacement_capture() {
+        let old = CaptureState::default();
+        old.generation.store(1, Ordering::Release);
+        old.running.store(true, Ordering::Release);
+        assert!(old.is_current(1)); // Callback admitted before a restart.
+        old.running.store(false, Ordering::Release);
+        old.generation.fetch_add(1, Ordering::AcqRel);
+        let replacement = old.next_capture();
+        replacement.running.store(true, Ordering::Release);
+        let frame = Arc::new(Frame::placeholder(
+            PIPELINE_SIZE,
+            0xff00_ff00,
+            2,
+            0,
+            Instant::now(),
+        ));
+        *replacement.latest.lock().unwrap() = Some(Arc::clone(&frame));
+        old.set_failure(
+            webcam_failure_without_hresult(&old, "late retired callback", true),
+            true,
+        );
+        assert!(replacement.running.load(Ordering::Acquire));
+        assert!(replacement.failure.lock().unwrap().is_none());
+        assert!(Arc::ptr_eq(
+            replacement.latest.lock().unwrap().as_ref().unwrap(),
+            &frame
+        ));
+    }
+
+    #[test]
+    fn native_720p_normalization_copies_rows_directly_and_reuses_pool_slots() {
+        let state = CaptureState::default();
+        let row_bytes = PIPELINE_SIZE.width as usize * 4;
+        let pitch = row_bytes + 16;
+        let mut source = vec![0; pitch * PIPELINE_SIZE.height as usize];
+        for row in 0..PIPELINE_SIZE.height as usize {
+            source[row * pitch..row * pitch + row_bytes].fill((row % 251) as u8);
+        }
+        let first = state
+            .normalize_sample(&source, 0, pitch as i32, PIPELINE_SIZE)
+            .unwrap();
+        let pointer = first.as_ptr();
+        assert!(state.scratch.lock().unwrap().is_empty());
+        assert!(
+            first[row_bytes..row_bytes * 2]
+                .iter()
+                .all(|byte| *byte == 1)
+        );
+        let second = state
+            .normalize_sample(
+                &source,
+                pitch * (PIPELINE_SIZE.height as usize - 1),
+                -(pitch as i32),
+                PIPELINE_SIZE,
+            )
+            .unwrap();
+        assert!(
+            second[..row_bytes]
+                .iter()
+                .all(|byte| *byte == ((PIPELINE_SIZE.height - 1) % 251) as u8)
+        );
+        drop(first);
+        let third = state
+            .normalize_sample(&source, 0, pitch as i32, PIPELINE_SIZE)
+            .unwrap();
+        assert_eq!(third.as_ptr(), pointer);
+        assert!(state.scratch.lock().unwrap().is_empty());
+        assert!(
+            state
+                .normalize_sample(&source[..10], 0, pitch as i32, PIPELINE_SIZE)
+                .is_err()
+        );
     }
 
     #[test]

@@ -306,19 +306,20 @@ impl IMFMediaSource_Impl for MediaSource_Impl {
         };
         // SAFETY: interfaces and GUID pointers remain valid for each queue call.
         let queued = unsafe {
+            // Announce the stream before reporting the source as started.
             self.events
-                .QueueEventParamVar(
-                    MESourceStarted.0 as u32,
+                .QueueEventParamUnk(
+                    event_type.0 as u32,
                     &GUID::zeroed(),
                     S_OK,
-                    started_event_position,
+                    &stream_interface,
                 )
                 .and_then(|()| {
-                    self.events.QueueEventParamUnk(
-                        event_type.0 as u32,
+                    self.events.QueueEventParamVar(
+                        MESourceStarted.0 as u32,
                         &GUID::zeroed(),
                         S_OK,
-                        &stream_interface,
+                        started_event_position,
                     )
                 })
                 .and_then(|()| self.stream.queue_started(started_event_position))
@@ -496,26 +497,26 @@ mod tests {
             let descriptor = source.CreatePresentationDescriptor()?;
             let start = PROPVARIANT::default();
             source.Start(&descriptor, core::ptr::null(), &start)?;
+            let new_stream = source.GetEvent(Default::default())?;
+            assert_eq!(new_stream.GetType()?, MENewStream.0 as u32);
             let source_started = source.GetEvent(Default::default())?;
             assert_eq!(source_started.GetType()?, MESourceStarted.0 as u32);
             let source_started_value = source_started.GetValue()?;
             let source_started_inner = &source_started_value.Anonymous.Anonymous;
             assert_eq!(source_started_inner.vt, VT_I8);
             assert!(source_started_inner.Anonymous.hVal >= 0);
-            let new_stream = source.GetEvent(Default::default())?;
-            assert_eq!(new_stream.GetType()?, MENewStream.0 as u32);
             let repeated_absolute_position = PROPVARIANT::from(0_i64);
             let repeated_start_error = source
                 .Start(&descriptor, core::ptr::null(), &repeated_absolute_position)
                 .expect_err("a running live source must reject seek-like starts");
             assert_eq!(repeated_start_error.code(), MF_E_INVALIDREQUEST);
             source.Start(&descriptor, core::ptr::null(), &start)?;
+            let updated_stream = source.GetEvent(Default::default())?;
+            assert_eq!(updated_stream.GetType()?, MEUpdatedStream.0 as u32);
             let source_resumed = source.GetEvent(Default::default())?;
             assert_eq!(source_resumed.GetType()?, MESourceStarted.0 as u32);
             let source_resumed_value = source_resumed.GetValue()?;
             assert_eq!(source_resumed_value.Anonymous.Anonymous.vt, VT_EMPTY);
-            let updated_stream = source.GetEvent(Default::default())?;
-            assert_eq!(updated_stream.GetType()?, MEUpdatedStream.0 as u32);
             source.Stop()?;
             let live_position = PROPVARIANT::from(0_i64);
             source.Start(&descriptor, core::ptr::null(), &live_position)?;

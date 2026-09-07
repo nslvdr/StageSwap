@@ -5,8 +5,8 @@ use stageswap_core::{
     DetectorSettings, DeviceState, Frame, FrameBufferPool, FrameCompositor, FrameMetadata,
     FramePacer, GrayImage, OutputLayout, OutputMode, PIPELINE_FPS, PIPELINE_SIZE, PipComposition,
     RunState, RuntimeAlert, RuntimeAlertSource, RuntimeWarning, Size, Source, SourceAvailability,
-    StillImageDetector, StillImagePipLayout, StillImagePipSize, TransitionController, bgra_to_gray,
-    decide, image_similarity, off_frame, resize_bgra_to_gray, resize_bilinear,
+    StillImageDetector, StillImagePipLayout, StillImagePipSize, TransitionController,
+    aspect_fit_bgra_into, decide, image_similarity, off_frame, resize_bgra_to_gray,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool as StdAtomicBool, Ordering as StdOrdering};
@@ -1534,9 +1534,21 @@ impl ReferenceWorker {
                     if worker_stop.load(StdOrdering::Acquire) {
                         break;
                     }
-                    let result = execute_reference_job(job);
-                    if result_sender.try_send(result).is_err() {
-                        break;
+                    let mut result = execute_reference_job(job);
+                    loop {
+                        if worker_stop.load(StdOrdering::Acquire) {
+                            break;
+                        }
+                        match result_sender.try_send(result) {
+                            Ok(()) => break,
+                            Err(std_mpsc::TrySendError::Disconnected(_)) => return,
+                            Err(std_mpsc::TrySendError::Full(pending)) => {
+                                result = pending;
+                                // Retain the result under backpressure without
+                                // blocking shutdown or growing the bounded queue.
+                                thread::park_timeout(Duration::from_millis(10));
+                            }
+                        }
                     }
                 }
                 let _ = done_sender.try_send(());
@@ -1571,6 +1583,9 @@ impl ReferenceWorker {
     fn signal_shutdown(&mut self) {
         self.stop.store(true, StdOrdering::Release);
         self.jobs.take();
+        if let Some(worker) = &self.worker {
+            worker.thread().unpark();
+        }
     }
 
     fn finish_shutdown(&mut self, timeout: Duration) -> bool {
@@ -1679,9 +1694,18 @@ fn reference_data_from_rgba(rgba: &image::RgbaImage) -> Result<ReferenceData, St
     for pixel in bgra.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
-    let detector = bgra_to_gray(&bgra, size, size.width as usize * 4)
-        .and_then(|image| resize_bilinear(&image, Size::new(160, 90)))
-        .map_err(|error| format!("could not prepare reference detector image: {error:?}"))?;
+    // Match the screen adapter's normalization, including letterboxing, before
+    // sampling the reference. Stretching imports changes their detector geometry.
+    let mut normalized = vec![0; (PIPELINE_SIZE.width * PIPELINE_SIZE.height * 4) as usize];
+    aspect_fit_bgra_into(&bgra, size, size.width * 4, &mut normalized, PIPELINE_SIZE)
+        .map_err(|error| format!("could not normalize reference image: {error:?}"))?;
+    let detector = resize_bgra_to_gray(
+        &normalized,
+        PIPELINE_SIZE,
+        PIPELINE_SIZE.width as usize * 4,
+        Size::new(160, 90),
+    )
+    .map_err(|error| format!("could not prepare reference detector image: {error:?}"))?;
     let preview_rgba = if size.width > REFERENCE_PREVIEW_SIZE.width
         || size.height > REFERENCE_PREVIEW_SIZE.height
     {
@@ -3289,16 +3313,28 @@ impl DevicePlatform {
             .snapshot
             .virtual_camera_component
             .transition(ComponentLifecycle::Restarting, now);
-        let result = if let Some(camera) = &mut self.camera {
-            camera.restart()
-        } else if self.publisher.is_none() {
-            Err("virtual camera frame publisher is unavailable".into())
-        } else if let Some(pipe_name) = &self.pipe_name {
-            VirtualCameraController::start(pipe_name.clone())
-                .map(|camera| self.camera = Some(camera))
-        } else {
-            Err("virtual camera pipe is unavailable".into())
-        };
+        let result = (|| {
+            if self.pipe_name.is_none() {
+                self.pipe_name = Some(frame_pipe_name()?);
+            }
+            let pipe_name = self.pipe_name.as_deref().expect("pipe name was resolved");
+            if let Err(error) = FramePublisher::ensure_running(&mut self.publisher, pipe_name) {
+                state
+                    .snapshot
+                    .publisher_component
+                    .mark_failed(now, error.clone());
+                state.set_warning(WarningSource::PublisherController, error.clone());
+                return Err(error);
+            }
+            state.snapshot.publisher_component.mark_ready(now);
+            state.clear_warning(WarningSource::PublisherController);
+            if let Some(camera) = &mut self.camera {
+                camera.restart()
+            } else {
+                VirtualCameraController::start(pipe_name.to_owned())
+                    .map(|camera| self.camera = Some(camera))
+            }
+        })();
         match result {
             Ok(()) => {
                 state.snapshot.virtual_camera_state = DeviceState::Ready;
@@ -3757,6 +3793,7 @@ impl PendingDeviceCommands {
     /// Coalesces installs and explicit clears while dismissing obsolete candidates.
     fn update_reference(&mut self, reference: Option<GrayImage>) {
         self.reference = Some(reference);
+        self.capture_candidate = false;
         self.discard_candidate = true;
     }
 
@@ -3764,6 +3801,7 @@ impl PendingDeviceCommands {
         match command {
             command @ (Command::UpdateSettings(_) | Command::ReloadSettings(_)) => {
                 self.settings = Some(command.clone());
+                self.mode = None;
             }
             command @ Command::SetMode(_) => self.mode = Some(command.clone()),
             Command::SelectMonitor(monitor) => self.monitor = Some(monitor.clone()),
@@ -3772,7 +3810,10 @@ impl PendingDeviceCommands {
             Command::Stop => self.stop_output = true,
             Command::CaptureReference => self.capture_reference = true,
             Command::CaptureReferenceCandidate => self.capture_candidate = true,
-            Command::DiscardReferenceCandidate => self.discard_candidate = true,
+            Command::DiscardReferenceCandidate => {
+                self.capture_candidate = false;
+                self.discard_candidate = true;
+            }
             Command::Restart(RestartTarget::All) => {
                 self.restarts.clear();
                 self.restarts.insert(RestartTarget::All);
@@ -3798,11 +3839,11 @@ impl PendingDeviceCommands {
         if std::mem::take(&mut self.capture_reference) {
             commands.push(Command::CaptureReference);
         }
-        if std::mem::take(&mut self.capture_candidate) {
-            commands.push(Command::CaptureReferenceCandidate);
-        }
         if std::mem::take(&mut self.discard_candidate) {
             commands.push(Command::DiscardReferenceCandidate);
+        }
+        if std::mem::take(&mut self.capture_candidate) {
+            commands.push(Command::CaptureReferenceCandidate);
         }
         if std::mem::take(&mut self.stop_output) {
             commands.push(Command::Stop);
@@ -4046,6 +4087,26 @@ fn ready_webcam_frame(snapshot: &AppSnapshot, now: Instant) -> Option<Arc<Frame>
         .cloned()
 }
 
+/// Static screen frames remain usable only while their owning worker is responsive.
+#[cfg(any(windows, test))]
+fn ready_screen_frame(
+    snapshot: &AppSnapshot,
+    observed_at: Option<Instant>,
+    now: Instant,
+) -> Option<Arc<Frame>> {
+    snapshot
+        .previews
+        .screen
+        .as_ref()
+        .filter(|_| {
+            snapshot.availability.screen_ready
+                && observed_at.is_some_and(|observed| {
+                    now.saturating_duration_since(observed) <= FRAME_STALE_AFTER
+                })
+        })
+        .cloned()
+}
+
 #[cfg(windows)]
 struct Platform {
     worker: Option<DeviceWorker>,
@@ -4128,10 +4189,9 @@ impl Platform {
                 .webcam_component
                 .transition(ComponentLifecycle::Stale, now);
         }
-        state.snapshot.previews.screen = app.previews.screen.clone();
+        state.snapshot.previews.screen = ready_screen_frame(app, device.observed_at, now);
         state.snapshot.availability.camera_ready = state.snapshot.previews.webcam.is_some();
-        state.snapshot.availability.screen_ready =
-            app.availability.screen_ready && state.snapshot.previews.screen.is_some();
+        state.snapshot.availability.screen_ready = state.snapshot.previews.screen.is_some();
 
         if let Some((capture_id, frame)) = &device.legacy_capture
             && *capture_id > worker.last_legacy_capture_id
@@ -4943,6 +5003,46 @@ mod tests {
     }
 
     #[test]
+    fn flow_reference_worker_retains_results_under_backpressure_and_can_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut worker = ReferenceWorker::start().unwrap();
+        let submit_batch = |worker: &ReferenceWorker| {
+            for generation in 1..=6 {
+                worker
+                    .jobs
+                    .as_ref()
+                    .unwrap()
+                    .send(ReferenceJob {
+                        generation,
+                        kind: ReferenceJobKind::Load {
+                            path: directory.path().join("missing.png"),
+                        },
+                    })
+                    .unwrap();
+            }
+        };
+        submit_batch(&worker);
+        // No consumer drains the four result slots while the worker completes
+        // this batch; reaching a full queue must not disconnect it.
+        assert!(matches!(
+            worker.done.recv_timeout(Duration::from_millis(100)),
+            Err(std_mpsc::RecvTimeoutError::Timeout)
+        ));
+        for generation in 1..=6 {
+            let result = worker.results.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(result.generation, generation);
+            assert!(result.result.is_err());
+        }
+        submit_batch(&worker);
+        assert!(matches!(
+            worker.done.recv_timeout(Duration::from_millis(100)),
+            Err(std_mpsc::RecvTimeoutError::Timeout)
+        ));
+        worker.signal_shutdown();
+        assert!(worker.finish_shutdown(Duration::from_secs(1)));
+    }
+
+    #[test]
     fn flow_reference_worker_shutdown_closes_jobs_and_joins_without_sleeping() {
         let (job_sender, job_receiver) = std_mpsc::sync_channel(REFERENCE_JOB_CAPACITY);
         let (result_sender, result_receiver) = std_mpsc::sync_channel(REFERENCE_JOB_CAPACITY);
@@ -5576,6 +5676,45 @@ mod tests {
     }
 
     #[test]
+    fn flow_imported_reference_matches_capture_geometry_and_survives_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        for (width, height) in [(640, 480), (1680, 720), (1280, 720)] {
+            let rgba = image::RgbaImage::from_fn(width, height, |x, y| {
+                let value = if (x / 80 + y / 60) % 2 == 0 { 210 } else { 50 };
+                image::Rgba([value, value, value, 255])
+            });
+            let source = directory.path().join("import.png");
+            let destination = directory.path().join("reference.png");
+            rgba.save(&source).unwrap();
+            let result = execute_reference_job(ReferenceJob {
+                generation: 1,
+                kind: ReferenceJobKind::Import {
+                    source,
+                    destination: destination.clone(),
+                },
+            })
+            .result
+            .unwrap();
+            let frame = Frame::new(
+                rgba.into_raw().into(),
+                Size::new(width, height),
+                width * 4,
+                1,
+                0,
+                Instant::now(),
+            )
+            .unwrap()
+            .aspect_fit(PIPELINE_SIZE, Instant::now());
+            let captured = gray_thumbnail(&frame).unwrap();
+            assert_eq!(image_similarity(&result.detector, &captured), 1.0);
+            assert_eq!(
+                decode_reference(&destination).unwrap().detector,
+                result.detector
+            );
+        }
+    }
+
+    #[test]
     fn flow_reference_candidate_is_isolated_discardable_and_committed_exactly() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("reference.png");
@@ -5853,6 +5992,59 @@ mod tests {
         assert_eq!(reference, Some(None));
         assert!(commands.contains(&Command::DiscardReferenceCandidate));
         assert_eq!(pending.take().1, None);
+    }
+
+    #[test]
+    fn flow_device_batches_preserve_candidate_and_output_intent() {
+        let mut pending = PendingDeviceCommands::default();
+        pending.push(&Command::DiscardReferenceCandidate);
+        pending.push(&Command::CaptureReferenceCandidate);
+        assert_eq!(
+            pending.take().0,
+            vec![
+                Command::DiscardReferenceCandidate,
+                Command::CaptureReferenceCandidate
+            ]
+        );
+        pending.push(&Command::CaptureReferenceCandidate);
+        pending.push(&Command::DiscardReferenceCandidate);
+        assert_eq!(pending.take().0, vec![Command::DiscardReferenceCandidate]);
+        pending.push(&Command::CaptureReferenceCandidate);
+        pending.update_reference(None);
+        assert_eq!(pending.take().0, vec![Command::DiscardReferenceCandidate]);
+        pending.push(&Command::SetMode(OutputMode::ForceScreen));
+        pending.push(&Command::ReloadSettings(Box::default()));
+        assert!(matches!(
+            pending.take().0.as_slice(),
+            [Command::ReloadSettings(_)]
+        ));
+        pending.push(&Command::UpdateSettings(Box::default()));
+        pending.push(&Command::SetMode(OutputMode::ForceCamera));
+        assert!(matches!(
+            pending.take().0.as_slice(),
+            [
+                Command::UpdateSettings(_),
+                Command::SetMode(OutputMode::ForceCamera)
+            ]
+        ));
+    }
+
+    #[test]
+    fn flow_screen_fallback_uses_worker_liveness_without_expiring_static_content() {
+        let now = Instant::now();
+        let mut snapshot = AppSnapshot::default();
+        let frame = Arc::new(solid_frame(128));
+        snapshot.previews.screen = Some(Arc::clone(&frame));
+        snapshot.availability.screen_ready = true;
+        let later = now + Duration::from_secs(60);
+        assert!(Arc::ptr_eq(
+            &ready_screen_frame(&snapshot, Some(later), later).unwrap(),
+            &frame
+        ));
+        assert!(ready_screen_frame(&snapshot, Some(now), later).is_none());
+        assert!(ready_screen_frame(&snapshot, None, now).is_none());
+        snapshot.availability.screen_ready = false;
+        assert!(ready_screen_frame(&snapshot, Some(later), later).is_none());
     }
 
     #[test]

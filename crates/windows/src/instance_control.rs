@@ -65,7 +65,13 @@ impl InstanceReadiness {
 
 impl InstanceControl {
     pub fn start(commands: mpsc::Sender<InstanceCommand>) -> Result<Self, String> {
-        let path = control_pipe_name(&current_user_sid()?);
+        Self::start_at_path(control_pipe_name(&current_user_sid()?), commands)
+    }
+
+    fn start_at_path(
+        path: String,
+        commands: mpsc::Sender<InstanceCommand>,
+    ) -> Result<Self, String> {
         let ready = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let worker_ready = Arc::clone(&ready);
@@ -110,8 +116,13 @@ impl Drop for InstanceControl {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
-            // SAFETY: cancellation is limited to this worker's blocking pipe calls.
-            let _ = unsafe { CancelSynchronousIo(HANDLE(worker.as_raw_handle())) };
+            // Cancellation affects only pending I/O. Keep canceling until the
+            // worker exits, including operations begun just after the first call.
+            while !worker.is_finished() {
+                // SAFETY: cancellation is limited to this live worker's pipe calls.
+                let _ = unsafe { CancelSynchronousIo(HANDLE(worker.as_raw_handle())) };
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
             let _ = worker.join();
         }
     }
@@ -298,6 +309,39 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_control_shutdown_releases_idle_and_partial_request_connections() {
+        let (done, completion) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            for scenario in 0..3 {
+                let name = format!(
+                    r"\\.\pipe\StageSwap.ControlShutdown.{}.{}",
+                    std::process::id(),
+                    scenario
+                );
+                let (sender, _receiver) = mpsc::channel();
+                let control = InstanceControl::start_at_path(name.clone(), sender).unwrap();
+                let mut client = (scenario != 0).then(|| {
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&name)
+                        .unwrap()
+                });
+                if scenario == 2 {
+                    std::io::Write::write_all(client.as_mut().unwrap(), &[PROTOCOL_VERSION])
+                        .unwrap();
+                }
+                drop(control);
+                drop(client);
+            }
+            done.send(()).unwrap();
+        });
+        completion
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+    }
 
     #[test]
     fn native_control_identity_and_protocol_are_stable() {

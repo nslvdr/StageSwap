@@ -335,7 +335,11 @@ impl ConfigStore {
             file.write_all(b"\n")?;
             file.sync_all()?;
         }
-        if self.config_path().exists() {
+        // A recovered configuration must not back up the corrupt primary over
+        // the last usable copy, especially if the following replacement fails.
+        if let Ok(primary) = fs::read_to_string(self.config_path())
+            && Self::parse(&primary).is_ok()
+        {
             fs::copy(self.config_path(), self.backup_path())?;
         }
         if let Err(error) = replace(&temporary, &self.config_path()) {
@@ -814,6 +818,20 @@ mod tests {
         );
         assert!(!directory.path().join("config.tmp.json").exists());
         assert_eq!(store.load().config, original);
+
+        fs::write(store.config_path(), b"corrupt primary").unwrap();
+        let recovered = store.load();
+        assert!(recovered.used_backup);
+        assert!(
+            store
+                .save_with_replace(&recovered.config, |_, _| {
+                    Err(io::Error::other("replacement remains unavailable"))
+                })
+                .is_err()
+        );
+        let recovered_again = store.load();
+        assert!(recovered_again.used_backup);
+        assert_eq!(recovered_again.config, original);
     }
 
     #[test]
