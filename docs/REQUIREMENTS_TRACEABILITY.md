@@ -18,6 +18,7 @@ This index maps the contracts in [Architecture](ARCHITECTURE.md) to implementati
 
 | Contract | Primary implementation | Verification evidence |
 | --- | --- | --- |
+| Recovery uses typed categories independently of diagnostic wording | Capture adapter errors; `runtime/recovery.rs` | Native status-code/category tests; host recovery-category tests |
 | Saved webcam identity, tiered format negotiation, row-aware normalization, optional cropping, and processing-rate cap | `MediaFoundationVideoInput`; rational format ranking, callback pacer, and fit/fill primitives | Rational-ranking, 30/60/59.94/120 admission, decimation-counter, crop-toggle, aspect, stride, conversion, x64-build, and native format checks |
 | Compatible media-type changes are revalidated; eligible failure retries the same webcam three times | Capture callback; `WebcamRecovery` | Media-type-change, circuit-breaker, generation, and recovery-state tests |
 | Windows Graphics Capture with cursor option, capability/HDR preflight, session-valid readiness, and two transient processing failures before terminal failure | `WindowsGraphicsScreenInput`; per-generation failure streak; `DevicePlatform` | Retained-frame, streak-reset, third-failure, closure, old-generation, verified-SDR eligibility, native WARP staging reuse/pitched-row readback, and native capture checks |
@@ -54,7 +55,7 @@ This index maps the contracts in [Architecture](ARCHITECTURE.md) to implementati
 | Native self-deploying Windows x64 executable with content-versioned source DLL and machine-wide, no-downgrade component arbitration | Deployment module; embedded resources; `xtask` | PE/payload validation, architecture checks, component compatibility decisions, first-run, registration, and native installation evidence |
 | Managed startup is transactional; run-once mode preserves installed startup state | Deployment startup helpers; General Settings | Registry status, transition, rollback, reconciliation, and native Windows checks |
 | Per-user uninstall preserves the shared machine source; explicit administrative cleanup removes machine deployment resources while preserving user data | Deployment cleanup/uninstall paths | Ownership-boundary, argument, filesystem, registry, and native removal checks |
-| Stable/Beta GitHub updates are manual, verified, replaceable, and rollback-safe | Update worker; WinHTTP adapter; replacement bootstrap | Release selection, configuration, checksum/digest, staged replacement, readiness, and rollback tests |
+| Stable/Beta GitHub updates are manual, verified, replaceable, and rollback-safe | Update worker; WinHTTP adapter; replacement bootstrap | Shared release-version parsing/ordering/overflow and SHA-256 vectors; release selection, configuration, checksum/digest, staged replacement, readiness, and rollback tests |
 
 ## Release evidence
 

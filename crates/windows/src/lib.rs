@@ -3,6 +3,9 @@
 #[cfg(all(windows, not(target_arch = "x86_64")))]
 compile_error!("StageSwap supports only x64 Windows");
 
+mod capture_error;
+pub use capture_error::{CaptureError, ScreenError, WebcamError};
+
 use stageswap_core::{Frame, MonitorDescriptor};
 use std::sync::Arc;
 
@@ -93,14 +96,18 @@ pub struct InputDevice {
 
 pub trait VideoInput: Send {
     fn enumerate(&self) -> Result<Vec<InputDevice>, String>;
-    fn start(&mut self, device_id: &str) -> Result<(), String>;
+    fn start(&mut self, device_id: &str) -> Result<(), WebcamError>;
     fn stop(&mut self);
     fn latest_frame(&self) -> Option<Arc<Frame>>;
 }
 
 pub trait ScreenInput: Send {
     fn enumerate(&self) -> Result<Vec<MonitorDescriptor>, String>;
-    fn start(&mut self, monitor: &MonitorDescriptor, cursor_visible: bool) -> Result<(), String>;
+    fn start(
+        &mut self,
+        monitor: &MonitorDescriptor,
+        cursor_visible: bool,
+    ) -> Result<(), ScreenError>;
     fn stop(&mut self);
     fn latest_frame(&self) -> Option<Arc<Frame>>;
 }

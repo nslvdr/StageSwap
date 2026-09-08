@@ -1,4 +1,5 @@
-use crate::{InputDevice, VideoInput};
+use crate::{InputDevice, VideoInput, WebcamError};
+use stageswap_core::WebcamFailureKind;
 use stageswap_core::{
     CAPTURE_FRAME_POOL_CAPACITY, Frame, FrameBufferPool, FramePacer, PIPELINE_SIZE, Size,
     aspect_fill_bgra_into, aspect_fit_bgra_into,
@@ -49,11 +50,11 @@ fn should_aspect_fill(enabled: bool, display_aspect_ratio: Option<f64>) -> bool 
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WebcamCaptureFailure {
+    pub kind: WebcamFailureKind,
     pub message: String,
     pub hresult: Option<i32>,
     pub device_tag: u64,
     pub capture_generation: u64,
-    pub recoverable: bool,
 }
 
 fn device_identity_tag(device_id: &str) -> u64 {
@@ -202,7 +203,7 @@ fn ranked_native_formats(reader: &IMFSourceReader) -> Vec<WebcamFormatCandidate>
 
 fn negotiate_rgb32_output(
     reader: &IMFSourceReader,
-) -> Result<(NegotiatedFormat, String, String), String> {
+) -> Result<(NegotiatedFormat, String, String), WebcamError> {
     let native = ranked_native_formats(reader);
     let native_description = native.first().map_or_else(
         || "no ranked native format".to_owned(),
@@ -229,8 +230,12 @@ fn negotiate_rgb32_output(
     candidates.extend(native.into_iter().filter(|candidate| *candidate != exact));
     let mut last_error = "camera exposed no convertible progressive format".to_owned();
     for candidate in candidates {
-        let output: IMFMediaType = unsafe { MFCreateMediaType() }
-            .map_err(|error| format!("could not create video output type: {error}"))?;
+        let output: IMFMediaType = unsafe { MFCreateMediaType() }.map_err(|error| {
+            WebcamError::new(
+                webcam_hresult_kind(error.code()),
+                format!("could not create video output type: {error}"),
+            )
+        })?;
         let frame_size = (u64::from(candidate.size.width) << 32) | u64::from(candidate.size.height);
         let frame_rate = (u64::from(candidate.frame_rate_numerator) << 32)
             | u64::from(candidate.frame_rate_denominator);
@@ -272,6 +277,13 @@ fn negotiate_rgb32_output(
             Ok(())
         })();
         if let Err(error) = configured {
+            let kind = webcam_hresult_kind(error.code());
+            if kind != WebcamFailureKind::DriverFailure {
+                return Err(WebcamError::new(
+                    kind,
+                    format!("could not configure webcam output: {error}"),
+                ));
+            }
             last_error = format!(
                 "{} {}x{} at {}/{} fps was rejected: {error}",
                 candidate.subtype,
@@ -283,8 +295,12 @@ fn negotiate_rgb32_output(
             continue;
         }
         // SAFETY: the reader is live and returns a retained media type.
-        let current = unsafe { reader.GetCurrentMediaType(STREAM) }
-            .map_err(|error| format!("could not read negotiated webcam format: {error}"))?;
+        let current = unsafe { reader.GetCurrentMediaType(STREAM) }.map_err(|error| {
+            WebcamError::new(
+                webcam_hresult_kind(error.code()),
+                format!("could not read negotiated webcam format: {error}"),
+            )
+        })?;
         match validate_negotiated_type(&current) {
             Ok(format) => {
                 let output_description = format!(
@@ -296,7 +312,10 @@ fn negotiate_rgb32_output(
             Err(error) => last_error = error,
         }
     }
-    Err(format!("could not negotiate a webcam format: {last_error}"))
+    Err(WebcamError::new(
+        WebcamFailureKind::UnsupportedFormat,
+        format!("could not negotiate a webcam format: {last_error}"),
+    ))
 }
 
 fn copy_bgra_rows(
@@ -619,7 +638,7 @@ impl CaptureState {
             && self.generation.load(Ordering::Acquire) == expected_generation
     }
 
-    fn request_next(&self, expected_generation: u64) -> Result<(), String> {
+    fn request_next(&self, expected_generation: u64) -> Result<(), WebcamError> {
         if !self.is_current(expected_generation) {
             return Ok(());
         }
@@ -630,6 +649,7 @@ impl CaptureState {
                 let device_tag = self.device_tag.load(Ordering::Acquire);
                 let capture_generation = self.generation.load(Ordering::Acquire);
                 let failure = WebcamCaptureFailure {
+                    kind: webcam_hresult_kind(error.code()),
                     message: webcam_error_message(
                         "webcam sample request failed",
                         error.code(),
@@ -639,11 +659,10 @@ impl CaptureState {
                     hresult: Some(error.code().0),
                     device_tag,
                     capture_generation,
-                    recoverable: webcam_hresult_is_recoverable(error.code()),
                 };
-                let message = failure.message.clone();
+                let error = WebcamError::new(failure.kind, failure.message.clone());
                 self.set_failure(failure, true);
-                return Err(message);
+                return Err(error);
             }
         }
         Ok(())
@@ -758,14 +777,23 @@ impl CaptureState {
     }
 }
 
-fn webcam_hresult_is_recoverable(code: HRESULT) -> bool {
-    code != E_ACCESSDENIED && code != MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED
+/// Maps native status codes before formatting diagnostics or making recovery decisions.
+fn webcam_hresult_kind(code: HRESULT) -> WebcamFailureKind {
+    if code == E_ACCESSDENIED {
+        WebcamFailureKind::PrivacyDisabled
+    } else if code == MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED {
+        WebcamFailureKind::DeviceBusy
+    } else if code == MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED {
+        WebcamFailureKind::DeviceInvalidated
+    } else {
+        WebcamFailureKind::DriverFailure
+    }
 }
 
 fn webcam_failure_without_hresult(
     state: &CaptureState,
     message: impl Into<String>,
-    recoverable: bool,
+    kind: WebcamFailureKind,
 ) -> WebcamCaptureFailure {
     let device_tag = state.device_tag.load(Ordering::Acquire);
     let capture_generation = state.generation.load(Ordering::Acquire);
@@ -775,11 +803,11 @@ fn webcam_failure_without_hresult(
         format!("device_tag={device_tag:016x}, capture_generation={capture_generation}")
     };
     WebcamCaptureFailure {
+        kind,
         message: format!("{} (HRESULT=unavailable, {identity})", message.into()),
         hresult: None,
         device_tag,
         capture_generation,
-        recoverable,
     }
 }
 
@@ -806,6 +834,7 @@ impl IMFSourceReaderCallback_Impl for ReaderCallback_Impl {
             let capture_generation = self.state.generation.load(Ordering::Acquire);
             self.state.set_failure(
                 WebcamCaptureFailure {
+                    kind: webcam_hresult_kind(status),
                     message: webcam_error_message(
                         "webcam sample failed",
                         status,
@@ -815,7 +844,6 @@ impl IMFSourceReaderCallback_Impl for ReaderCallback_Impl {
                     hresult: Some(status.0),
                     device_tag,
                     capture_generation,
-                    recoverable: webcam_hresult_is_recoverable(status),
                 },
                 true,
             );
@@ -825,7 +853,7 @@ impl IMFSourceReaderCallback_Impl for ReaderCallback_Impl {
                 webcam_failure_without_hresult(
                     &self.state,
                     "webcam source reader reported a capture error",
-                    true,
+                    WebcamFailureKind::DriverFailure,
                 ),
                 true,
             );
@@ -841,7 +869,7 @@ impl IMFSourceReaderCallback_Impl for ReaderCallback_Impl {
                 webcam_failure_without_hresult(
                     &self.state,
                     format!("webcam media-type change is incompatible: {error}"),
-                    false,
+                    WebcamFailureKind::IncompatibleTypeChange,
                 ),
                 true,
             );
@@ -939,7 +967,11 @@ impl IMFSourceReaderCallback_Impl for ReaderCallback_Impl {
                 if let Err(error) = copy_result {
                     self.state.dropped_frames.fetch_add(1, Ordering::Relaxed);
                     self.state.set_failure(
-                        webcam_failure_without_hresult(&self.state, error, true),
+                        webcam_failure_without_hresult(
+                            &self.state,
+                            error,
+                            WebcamFailureKind::DriverFailure,
+                        ),
                         false,
                     );
                 }
@@ -949,7 +981,7 @@ impl IMFSourceReaderCallback_Impl for ReaderCallback_Impl {
                     webcam_failure_without_hresult(
                         &self.state,
                         "could not obtain a contiguous webcam buffer",
-                        true,
+                        WebcamFailureKind::DriverFailure,
                     ),
                     false,
                 );
@@ -1020,11 +1052,11 @@ impl VideoInput for MediaFoundationVideoInput {
         enumerate_video_devices()
     }
 
-    fn start(&mut self, device_id: &str) -> Result<(), String> {
+    fn start(&mut self, device_id: &str) -> Result<(), WebcamError> {
         self.selected_native_format = None;
         self.selected_output_format = None;
         if let Some(error) = &self.initialization_error {
-            return Err(error.clone());
+            return Err(error.clone().into());
         }
         if device_id.is_empty() {
             return Err("video source identifier is empty".into());
@@ -1041,7 +1073,12 @@ impl VideoInput for MediaFoundationVideoInput {
             }
             Ok(())
         })()
-        .map_err(|error| format!("could not create video capture attributes: {error}"))?;
+        .map_err(|error| {
+            WebcamError::new(
+                webcam_hresult_kind(error.code()),
+                format!("could not create video capture attributes: {error}"),
+            )
+        })?;
         let source_attributes = source_attributes.expect("attributes were created");
         let reader_attributes = reader_attributes.expect("attributes were created");
         let id: Vec<u16> = device_id.encode_utf16().chain([0]).collect();
@@ -1059,15 +1096,23 @@ impl VideoInput for MediaFoundationVideoInput {
             }
             Ok(())
         })()
-        .map_err(|error| format!("could not configure video source: {error}"))?;
+        .map_err(|error| {
+            WebcamError::new(
+                webcam_hresult_kind(error.code()),
+                format!("could not configure video source: {error}"),
+            )
+        })?;
         let device_tag = device_identity_tag(device_id);
         let capture_generation = self.state.generation.load(Ordering::Acquire);
         let source = unsafe { MFCreateDeviceSource(&source_attributes) }.map_err(|error| {
-            webcam_error_message(
-                "could not open video source",
-                error.code(),
-                device_tag,
-                capture_generation,
+            WebcamError::new(
+                webcam_hresult_kind(error.code()),
+                webcam_error_message(
+                    "could not open video source",
+                    error.code(),
+                    device_tag,
+                    capture_generation,
+                ),
             )
         })?;
         let expected_generation = self.state.generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -1085,9 +1130,19 @@ impl VideoInput for MediaFoundationVideoInput {
             }
             Ok(())
         })()
-        .map_err(|error| format!("could not configure video reader: {error}"))?;
+        .map_err(|error| {
+            WebcamError::new(
+                webcam_hresult_kind(error.code()),
+                format!("could not configure video reader: {error}"),
+            )
+        })?;
         let reader = unsafe { MFCreateSourceReaderFromMediaSource(&source, &reader_attributes) }
-            .map_err(|error| format!("could not create video reader: {error}"))?;
+            .map_err(|error| {
+                WebcamError::new(
+                    webcam_hresult_kind(error.code()),
+                    format!("could not create video reader: {error}"),
+                )
+            })?;
         let (format, native_description, output_description) = negotiate_rgb32_output(&reader)?;
         self.selected_native_format = Some(native_description);
         self.selected_output_format = Some(output_description);
@@ -1284,7 +1339,11 @@ mod format_tests {
         state.running.store(true, Ordering::Release);
         for _ in 0..WEBCAM_FAILURE_THRESHOLD {
             state.set_failure(
-                webcam_failure_without_hresult(&state, "scripted callback failure", true),
+                webcam_failure_without_hresult(
+                    &state,
+                    "scripted callback failure",
+                    WebcamFailureKind::DriverFailure,
+                ),
                 false,
             );
         }
@@ -1367,6 +1426,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn contract_capture_failure_categories_do_not_depend_on_diagnostic_words() {
+        for (code, expected) in [
+            (E_ACCESSDENIED, WebcamFailureKind::PrivacyDisabled),
+            (
+                MF_E_VIDEO_RECORDING_DEVICE_PREEMPTED,
+                WebcamFailureKind::DeviceBusy,
+            ),
+            (
+                MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED,
+                WebcamFailureKind::DeviceInvalidated,
+            ),
+            (
+                HRESULT(0x80004005_u32 as i32),
+                WebcamFailureKind::DriverFailure,
+            ),
+        ] {
+            assert_eq!(webcam_hresult_kind(code), expected);
+        }
+        let state = CaptureState::default();
+        let failure = webcam_failure_without_hresult(
+            &state,
+            "privacy format unavailable",
+            WebcamFailureKind::DriverFailure,
+        );
+        assert_eq!(failure.kind, WebcamFailureKind::DriverFailure);
+        let failure = webcam_failure_without_hresult(
+            &state,
+            "diagnostic wording changed",
+            WebcamFailureKind::IncompatibleTypeChange,
+        );
+        assert_eq!(failure.kind, WebcamFailureKind::IncompatibleTypeChange);
+    }
+
+    #[test]
     fn native_capture_generation_rejects_callbacks_from_stopped_reader() {
         let state = CaptureState::default();
         let generation = state.generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -1395,7 +1488,11 @@ mod tests {
         ));
         *replacement.latest.lock().unwrap() = Some(Arc::clone(&frame));
         old.set_failure(
-            webcam_failure_without_hresult(&old, "late retired callback", true),
+            webcam_failure_without_hresult(
+                &old,
+                "late retired callback",
+                WebcamFailureKind::DriverFailure,
+            ),
             true,
         );
         assert!(replacement.running.load(Ordering::Acquire));

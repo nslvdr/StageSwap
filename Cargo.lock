@@ -4324,6 +4324,7 @@ version = "1.0.6"
 dependencies = [
  "anyhow",
  "dialoguer",
+ "stageswap-core",
  "tempfile",
 ]
 

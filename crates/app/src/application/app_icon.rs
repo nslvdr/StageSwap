@@ -1,6 +1,6 @@
 use image::imageops::FilterType;
 
-const APP_ICON_PNG: &[u8] = include_bytes!("../assets/app-icon.png");
+const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/app-icon.png");
 
 pub struct AppIcon {
     pub rgba: Vec<u8>,

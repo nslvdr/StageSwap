@@ -45,6 +45,8 @@ Dashboard rendering does not own the output clock. Embedded previews use dedicat
 
 ## Capture, discovery, and recovery
 
+Capture adapters return typed failure categories alongside diagnostic messages. Recovery decisions use those categories and native status codes, never message wording; the runtime owns the retry policy.
+
 ### Webcam
 
 Configuration stores one Media Foundation symbolic link. Startup and settings changes open that exact device; StageSwap does not continuously enumerate webcams or silently choose a replacement.

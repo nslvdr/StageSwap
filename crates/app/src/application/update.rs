@@ -2,7 +2,6 @@
 use serde::Deserialize;
 #[cfg(any(windows, test))]
 use stageswap_core::UpdateChannel;
-use std::cmp::Ordering;
 #[cfg(any(windows, test))]
 use std::fs;
 #[cfg(any(windows, test))]
@@ -26,58 +25,7 @@ const MAX_CHECKSUM_BYTES: usize = 64 * 1024;
 #[cfg(windows)]
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ReleaseVersion {
-    pub(crate) major: u64,
-    pub(crate) minor: u64,
-    pub(crate) patch: u64,
-}
-
-impl ReleaseVersion {
-    pub(crate) fn parse(value: &str) -> Result<Self, String> {
-        let value = value.strip_prefix('v').unwrap_or(value);
-        let mut parts = value.split('.');
-        let version = Self {
-            major: parts
-                .next()
-                .ok_or_else(|| "missing major version".to_owned())?
-                .parse()
-                .map_err(|_| "invalid major version".to_owned())?,
-            minor: parts
-                .next()
-                .ok_or_else(|| "missing minor version".to_owned())?
-                .parse()
-                .map_err(|_| "invalid minor version".to_owned())?,
-            patch: parts
-                .next()
-                .ok_or_else(|| "missing patch version".to_owned())?
-                .parse()
-                .map_err(|_| "invalid patch version".to_owned())?,
-        };
-        if parts.next().is_some() {
-            return Err("version must contain exactly three numbers".into());
-        }
-        Ok(version)
-    }
-}
-
-impl Ord for ReleaseVersion {
-    fn cmp(&self, other: &Self) -> Ordering {
-        (self.major, self.minor, self.patch).cmp(&(other.major, other.minor, other.patch))
-    }
-}
-
-impl PartialOrd for ReleaseVersion {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl std::fmt::Display for ReleaseVersion {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
-    }
-}
+pub(crate) use stageswap_core::release::ReleaseVersion;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AvailableUpdate {

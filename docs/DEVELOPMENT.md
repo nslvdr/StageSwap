@@ -16,6 +16,10 @@ Use the pinned toolchain in [`rust-toolchain.toml`](../rust-toolchain.toml), whi
 | `xtask` | Packaging, PE validation, checksums, and release publishing |
 | `scripts` | Local packaging and release-evidence helpers |
 
+Inside `crates/app/src`, `application.rs` coordinates the UI and owns feature modules under `application/`: settings, setup, dialogs, updates, notifications, and previews. Update state and preview resources are grouped with their respective UI modules. `runtime.rs` owns the engine; `runtime/` contains selected-device orchestration, discovery workers, reference I/O, recovery, diagnostics, effects, and focused timing helpers. Existing cross-component tests remain alongside each coordinator in `tests.rs`.
+
+`xtask` separates check execution, terminal progress, and artifact validation from release orchestration. The publisher and updater share the release-version and checksum contracts in `stageswap-core`.
+
 The default workspace members are `stageswap-core` and `xtask`, allowing useful host development on non-Windows systems.
 
 ## Local checks
@@ -26,7 +30,7 @@ Before pushing to `main`, run the host gate:
 sh scripts/check-host.sh
 ```
 
-This runs formatting, host Clippy, Windows-target Clippy, the debug workspace suite, and the release workspace suite. Run an individual command directly when iterating on one class of failure.
+The wrapper invokes `cargo run --quiet -p xtask -- check`, which uses the same check sequence as release publishing: formatting, host Clippy, Windows-target Clippy, the debug workspace suite, and the release workspace suite. The `check` command performs validation only; it does not publish a release. Run an individual command directly when iterating on one class of failure.
 
 Cross-target linting catches Windows-only compilation issues available to the host toolchain:
 

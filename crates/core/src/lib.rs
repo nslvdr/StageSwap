@@ -8,6 +8,7 @@ pub mod image;
 pub mod ipc;
 pub mod monitor;
 pub mod pacer;
+pub mod release;
 pub mod runtime;
 pub mod sha256;
 pub mod stillness;

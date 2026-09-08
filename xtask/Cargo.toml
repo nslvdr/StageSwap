@@ -9,3 +9,4 @@ license.workspace = true
 anyhow.workspace = true
 dialoguer = "0.11"
 tempfile = "3"
+stageswap-core = { path = "../crates/core" }

@@ -1,4 +1,5 @@
-use crate::ScreenInput;
+use crate::{ScreenError, ScreenInput};
+use stageswap_core::ScreenFailureKind;
 use stageswap_core::{
     CAPTURE_FRAME_POOL_CAPACITY, Frame, FrameBufferPool, FramePacer, MonitorDescriptor,
     PIPELINE_SIZE, Size, aspect_fit_bgra_into,
@@ -107,7 +108,7 @@ fn display_uses_hdr_or_ten_bit(display_name: &str) -> Result<bool, String> {
 #[derive(Default)]
 struct Shared {
     latest: Mutex<Option<Arc<Frame>>>,
-    failure: Mutex<Option<String>>,
+    failure: Mutex<Option<ScreenError>>,
     generation: AtomicU64,
     sequence: AtomicU64,
     pool_fallbacks: AtomicU64,
@@ -119,7 +120,7 @@ impl Shared {
         self.generation.load(Ordering::Acquire) == expected_generation
     }
 
-    fn record_failure(&self, expected_generation: u64, message: impl Into<String>) {
+    fn record_failure(&self, expected_generation: u64, error: ScreenError) {
         if !self.is_current(expected_generation) {
             return;
         }
@@ -127,7 +128,7 @@ impl Shared {
             *latest = None;
         }
         if let Ok(mut failure) = self.failure.lock() {
-            *failure = Some(message.into());
+            *failure = Some(error);
         }
     }
 }
@@ -305,7 +306,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
                 return Ok(());
             }
             self.shared
-                .record_failure(self.expected_generation, error.clone());
+                .record_failure(self.expected_generation, error.clone().into());
         }
         result
     }
@@ -313,7 +314,10 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
     fn on_closed(&mut self) -> Result<(), Self::Error> {
         self.shared.record_failure(
             self.expected_generation,
-            "selected display closed the screen-capture session",
+            ScreenError::new(
+                ScreenFailureKind::Closed,
+                "selected display closed the screen-capture session",
+            ),
         );
         Ok(())
     }
@@ -343,6 +347,10 @@ impl WindowsGraphicsScreenInput {
     }
 
     pub fn last_error(&self) -> Option<String> {
+        self.last_failure().map(|error| error.message)
+    }
+
+    pub fn last_failure(&self) -> Option<ScreenError> {
         if self
             .control
             .as_ref()
@@ -357,7 +365,7 @@ impl WindowsGraphicsScreenInput {
             if !has_failure {
                 self.shared.record_failure(
                     self.generation(),
-                    "screen capture worker stopped unexpectedly",
+                    "screen capture worker stopped unexpectedly".into(),
                 );
             }
         }
@@ -393,13 +401,13 @@ impl ScreenInput for WindowsGraphicsScreenInput {
         &mut self,
         descriptor: &MonitorDescriptor,
         cursor_visible: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), ScreenError> {
         self.stop();
         if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
-            return Err(
-                "Windows Graphics Capture is unavailable in this Windows session or configuration"
-                    .into(),
-            );
+            return Err(ScreenError::new(
+                ScreenFailureKind::UnsupportedCapture,
+                "Windows Graphics Capture is unavailable in this Windows session or configuration",
+            ));
         }
         let monitor = Monitor::enumerate()
             .map_err(|error| format!("could not enumerate monitors: {error}"))?
@@ -409,7 +417,12 @@ impl ScreenInput for WindowsGraphicsScreenInput {
                     .device_name()
                     .is_ok_and(|name| name == descriptor.display_name)
             })
-            .ok_or_else(|| format!("monitor {} is no longer available", descriptor.display_name))?;
+            .ok_or_else(|| {
+                ScreenError::new(
+                    ScreenFailureKind::MissingSelectedMonitor,
+                    format!("monitor {} is no longer available", descriptor.display_name),
+                )
+            })?;
         let cursor = if cursor_visible {
             CursorCaptureSettings::WithCursor
         } else {
@@ -641,10 +654,15 @@ mod tests {
         assert!(!streak.failed());
         assert!(!streak.failed());
         assert!(streak.failed());
-        shared.record_failure(3, "normalization failed three times");
+        shared.record_failure(3, "normalization failed three times".into());
         assert!(shared.latest.lock().unwrap().is_none());
         assert_eq!(
-            shared.failure.lock().unwrap().as_deref(),
+            shared
+                .failure
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|error| error.message.as_str()),
             Some("normalization failed three times")
         );
     }
@@ -667,7 +685,7 @@ mod tests {
         let frame = test_frame();
         *shared.latest.lock().unwrap() = Some(Arc::clone(&frame));
 
-        shared.record_failure(3, "old callback failed");
+        shared.record_failure(3, "old callback failed".into());
 
         assert!(Arc::ptr_eq(
             shared.latest.lock().unwrap().as_ref().unwrap(),
