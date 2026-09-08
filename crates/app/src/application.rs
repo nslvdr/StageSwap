@@ -84,6 +84,8 @@ mod local_log;
 mod notifications;
 #[path = "preview_conversion.rs"]
 mod preview_conversion;
+#[path = "settings_persistence.rs"]
+mod settings_persistence;
 #[path = "setup_guide.rs"]
 mod setup_guide;
 #[cfg(windows)]
@@ -1179,6 +1181,7 @@ struct SwitcherApp {
     view: AppView,
     settings_tab: SettingsTab,
     pending_settings_save: Option<Instant>,
+    settings_writer: Option<settings_persistence::SettingsPersistence>,
     settings_save_error: Option<String>,
     admin_profile_status: Option<AdminProfileStatus>,
     active_dialog: Option<ActiveDialog>,
@@ -1265,6 +1268,13 @@ impl SwitcherApp {
             load_warnings.push(error);
         })
         .ok();
+        let settings_store = store.clone();
+        let settings_writer = settings_persistence::SettingsPersistence::start(move |config| {
+            save_config(&settings_store, config)
+                .map_err(|error| format!("Could not save settings: {error}"))
+        })
+        .map_err(|error| load_warnings.push(error))
+        .ok();
         let notification_now = Instant::now();
         let mut notifications = NotificationCenter::default();
         for warning in &load_warnings {
@@ -1287,6 +1297,7 @@ impl SwitcherApp {
             view: AppView::Dashboard,
             settings_tab: SettingsTab::General,
             pending_settings_save: None,
+            settings_writer,
             settings_save_error: None,
             admin_profile_status,
             active_dialog: None,
@@ -1755,12 +1766,41 @@ impl SwitcherApp {
             return;
         }
         self.send(Command::UpdateSettings(Box::new(self.config.clone())));
-        match save_config(&self.store, &self.config) {
-            Ok(()) => self.settings_save_error = None,
-            Err(error) => {
-                self.record_settings_save_error(format!("Could not save settings: {error}"));
+        self.persist_settings();
+    }
+
+    fn persist_settings(&mut self) {
+        if let Some(writer) = &self.settings_writer {
+            writer.submit(self.config.clone());
+        } else {
+            self.record_settings_save_error(
+                "Could not save settings: settings writer is unavailable".into(),
+            );
+        }
+    }
+
+    fn poll_settings_save(&mut self) {
+        if let Some(result) = self
+            .settings_writer
+            .as_ref()
+            .and_then(|writer| writer.poll())
+        {
+            match result {
+                Ok(()) => self.settings_save_error = None,
+                Err(error) => self.record_settings_save_error(error),
             }
         }
+    }
+
+    #[cfg(test)]
+    fn wait_for_settings_save(&mut self) {
+        assert!(
+            self.settings_writer
+                .as_ref()
+                .unwrap()
+                .drain(Duration::from_secs(2))
+        );
+        self.poll_settings_save();
     }
 
     fn record_settings_save_error(&mut self, message: String) {
@@ -1780,14 +1820,7 @@ impl SwitcherApp {
         self.config
             .selected_monitor_label
             .clone_from(&monitor.label);
-        match save_config(&self.store, &self.config) {
-            Ok(()) => self.settings_save_error = None,
-            Err(error) => {
-                self.record_settings_save_error(format!(
-                    "Could not save monitor selection: {error}"
-                ));
-            }
-        }
+        self.persist_settings();
     }
 
     fn open_settings(&mut self) {
@@ -2223,6 +2256,18 @@ impl SwitcherApp {
     }
 
     fn load_admin_config(&mut self) {
+        // A pending older write must finish before the restore replaces config.json.
+        if self
+            .settings_writer
+            .as_ref()
+            .is_some_and(|writer| !writer.drain(Duration::from_secs(2)))
+        {
+            self.record_admin_failure(
+                "Could not load the admin config: settings are still being saved".into(),
+            );
+            return;
+        }
+        self.poll_settings_save();
         let admin_store = AdminProfileStore::new(self.store.directory());
         match restore_admin_profile_now(&admin_store) {
             Ok(AdminRestoreOutcome::Restored) => {
@@ -6198,7 +6243,7 @@ impl eframe::App for SwitcherApp {
                         self.show_window(context);
                     }
                     stageswap_windows::InstanceCommand::ShutdownForReplacement => {
-                        let _ = save_config(&self.store, &self.config);
+                        self.persist_settings();
                         self.exit_requested = true;
                         self.dismiss_dialog();
                         context.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -6224,12 +6269,7 @@ impl eframe::App for SwitcherApp {
             && snapshot.selected_video_device_id != self.config.selected_video_device_id
         {
             self.config.selected_video_device_id = snapshot.selected_video_device_id.clone();
-            match save_config(&self.store, &self.config) {
-                Ok(()) => self.settings_save_error = None,
-                Err(error) => self.record_settings_save_error(format!(
-                    "Could not save automatic webcam selection: {error}"
-                )),
-            }
+            self.persist_settings();
         }
         if self
             .awaiting_monitor_label
@@ -6248,6 +6288,7 @@ impl eframe::App for SwitcherApp {
         if self.settings_save_due(Instant::now()) {
             self.flush_settings();
         }
+        self.poll_settings_save();
         let first_activity_id = snapshot.recent_activity_first_id;
         if self.last_activity_id.saturating_add(1) < first_activity_id {
             self.log.write(
@@ -6446,7 +6487,9 @@ impl Drop for SwitcherApp {
         if self.ui_preview.is_some() {
             return;
         }
-        let _ = save_config(&self.store, &self.config);
+        self.persist_settings();
+        // Drop joins the single writer after its final pending value is saved.
+        self.settings_writer.take();
     }
 }
 
@@ -11326,6 +11369,7 @@ mod tests {
 
         app.view = AppView::Settings;
         app.close_settings();
+        app.wait_for_settings_save();
         assert_eq!(app.view, AppView::Dashboard);
         assert!(app.pending_settings_save.is_none());
         let saved = store.load().config;
@@ -11365,6 +11409,7 @@ mod tests {
         };
 
         app.sync_selected_monitor_preference(&snapshot);
+        app.wait_for_settings_save();
 
         assert_eq!(app.config.selected_monitor_label, "Stage Display");
         assert_eq!(store.load().config.selected_monitor_label, "Stage Display");
@@ -11422,6 +11467,7 @@ mod tests {
         app.config.show_notifications = false;
         app.queue_settings_save();
         app.flush_settings();
+        app.wait_for_settings_save();
 
         assert!(!app.config.show_notifications);
         assert!(
@@ -11449,6 +11495,7 @@ mod tests {
         app.config.verbose_logging = true;
         app.queue_settings_save();
         app.flush_settings();
+        app.wait_for_settings_save();
 
         assert!(app.settings_save_error.is_none());
         assert!(store.load().config.verbose_logging);

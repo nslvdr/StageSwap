@@ -1499,13 +1499,51 @@ enum ReferenceJobKind {
     },
 }
 
+/// Cancellation wins until the worker claims the final atomic replacement.
+/// Once claimed, completion must be reconciled with runtime state even if the UI moves on.
+#[derive(Default)]
+struct ReferenceCommit(std::sync::atomic::AtomicU8);
+
+impl ReferenceCommit {
+    const PENDING: u8 = 0;
+    const CANCELLED: u8 = 1;
+    const COMMITTING: u8 = 2;
+
+    fn cancel(&self) {
+        let _ = self.0.compare_exchange(
+            Self::PENDING,
+            Self::CANCELLED,
+            StdOrdering::AcqRel,
+            StdOrdering::Acquire,
+        );
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.load(StdOrdering::Acquire) == Self::CANCELLED
+    }
+
+    fn claim(&self) -> Result<(), String> {
+        match self.0.compare_exchange(
+            Self::PENDING,
+            Self::COMMITTING,
+            StdOrdering::AcqRel,
+            StdOrdering::Acquire,
+        ) {
+            Ok(_) | Err(Self::COMMITTING) => Ok(()),
+            Err(_) => Err("Reference save was cancelled before replacement".into()),
+        }
+    }
+}
+
 struct ReferenceJob {
     generation: u64,
+    commit: Option<Arc<ReferenceCommit>>,
     kind: ReferenceJobKind,
 }
 
 struct ReferenceResult {
     generation: u64,
+    persisted_path: Option<std::path::PathBuf>,
     action: ReferenceAction,
     result: Result<ReferenceData, String>,
 }
@@ -1603,6 +1641,11 @@ impl Drop for ReferenceWorker {
 }
 
 fn execute_reference_job(job: ReferenceJob) -> ReferenceResult {
+    let persisted_path = match &job.kind {
+        ReferenceJobKind::Load { .. } => None,
+        ReferenceJobKind::Persist { path, .. } => Some(path.clone()),
+        ReferenceJobKind::Import { destination, .. } => Some(destination.clone()),
+    };
     let (action, result) = match job.kind {
         ReferenceJobKind::Load { path } => {
             cleanup_pending_reference(&path);
@@ -1622,8 +1665,9 @@ fn execute_reference_job(job: ReferenceJob) -> ReferenceResult {
                     frame_sequence: frame.sequence,
                 }
             };
-            let result = reference_data_from_frame(&frame)
-                .and_then(|data| persist_frame_atomic(&frame, &path).map(|()| data));
+            let result = reference_data_from_frame(&frame).and_then(|data| {
+                persist_frame_guarded(&frame, &path, job.commit.as_deref()).map(|()| data)
+            });
             (action, result)
         }
         ReferenceJobKind::Import {
@@ -1632,7 +1676,7 @@ fn execute_reference_job(job: ReferenceJob) -> ReferenceResult {
         } => {
             let result = decode_rgba_limited(&source).and_then(|rgba| {
                 let data = reference_data_from_rgba(&rgba)?;
-                persist_rgba_atomic(&rgba, &destination)?;
+                persist_rgba_guarded(&rgba, &destination, job.commit.as_deref())?;
                 Ok(data)
             });
             (ReferenceAction::Import, result)
@@ -1640,6 +1684,7 @@ fn execute_reference_job(job: ReferenceJob) -> ReferenceResult {
     };
     ReferenceResult {
         generation: job.generation,
+        persisted_path,
         action,
         result,
     }
@@ -1750,19 +1795,37 @@ fn cleanup_pending_reference(destination: &std::path::Path) {
     }
 }
 
+#[cfg(test)]
 fn persist_frame_atomic(frame: &Frame, destination: &std::path::Path) -> Result<(), String> {
+    persist_frame_guarded(frame, destination, None)
+}
+
+fn persist_frame_guarded(
+    frame: &Frame,
+    destination: &std::path::Path,
+    commit: Option<&ReferenceCommit>,
+) -> Result<(), String> {
     let mut rgba = frame.pixels().to_vec();
     for pixel in rgba.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
     let rgba = image::RgbaImage::from_raw(frame.size.width, frame.size.height, rgba)
         .ok_or_else(|| "reference frame layout is invalid".to_owned())?;
-    persist_rgba_atomic(&rgba, destination)
+    persist_rgba_guarded(&rgba, destination, commit)
 }
 
+#[cfg(test)]
 fn persist_rgba_atomic(
     rgba: &image::RgbaImage,
     destination: &std::path::Path,
+) -> Result<(), String> {
+    persist_rgba_guarded(rgba, destination, None)
+}
+
+fn persist_rgba_guarded(
+    rgba: &image::RgbaImage,
+    destination: &std::path::Path,
+    commit: Option<&ReferenceCommit>,
 ) -> Result<(), String> {
     if destination.as_os_str().is_empty() {
         return Err("reference image path is empty".into());
@@ -1781,12 +1844,16 @@ fn persist_rgba_atomic(
     let pending = pending_reference_path(destination);
     let mut last_error = None;
     for attempt in 0..3 {
+        if commit.is_some_and(ReferenceCommit::is_cancelled) {
+            cleanup_pending_reference(destination);
+            return Err("Reference save was cancelled before replacement".into());
+        }
         if attempt > 0 {
             let delay = Duration::from_millis(50 * (1_u64 << (attempt - 1)));
             thread::sleep(delay);
         }
         cleanup_pending_reference(destination);
-        match persist_rgba_once(rgba, destination, &pending) {
+        match persist_rgba_once(rgba, destination, &pending, commit) {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(format!("attempt {}: {error}", attempt + 1));
@@ -1806,6 +1873,7 @@ fn persist_rgba_once(
     rgba: &image::RgbaImage,
     destination: &std::path::Path,
     pending: &std::path::Path,
+    commit: Option<&ReferenceCommit>,
 ) -> Result<(), String> {
     image::save_buffer(
         pending,
@@ -1836,6 +1904,9 @@ fn persist_rgba_once(
         )
     })?;
     validate_pending_reference(pending, rgba.width(), rgba.height())?;
+    if let Some(commit) = commit {
+        commit.claim()?;
+    }
     replace_reference_atomic(pending, destination)
 }
 
@@ -1928,6 +1999,7 @@ struct RuntimeEngine<P> {
     reference_worker: Option<ReferenceWorker>,
     reference_generation: u64,
     in_flight_candidate: Option<(u64, u64)>,
+    reference_commit: Option<Arc<ReferenceCommit>>,
     last_deadline_log: Instant,
 }
 
@@ -1949,6 +2021,7 @@ impl<P: RuntimePorts> RuntimeEngine<P> {
             reference_worker,
             reference_generation: 0,
             in_flight_candidate: None,
+            reference_commit: None,
             last_deadline_log: now - Duration::from_secs(30),
         };
         let path = std::path::PathBuf::from(engine.state.config.reference_image_path.clone());
@@ -1961,6 +2034,17 @@ impl<P: RuntimePorts> RuntimeEngine<P> {
     }
 
     fn command(&mut self, command: Command) -> bool {
+        if matches!(
+            command,
+            Command::DiscardReferenceCandidate | Command::CaptureReferenceCandidate
+        ) && self.in_flight_candidate.is_some()
+        {
+            if let Some(commit) = &self.reference_commit {
+                commit.cancel();
+            }
+            self.reference_generation = self.reference_generation.wrapping_add(1).max(1);
+            self.in_flight_candidate = None;
+        }
         let previous_reference_path = self.state.config.reference_image_path.clone();
         self.platform.command(&command, &mut self.state);
         if !self.state.command(command.clone()) {
@@ -2046,13 +2130,20 @@ impl<P: RuntimePorts> RuntimeEngine<P> {
             self.state.record("Reference worker is unavailable");
             return false;
         };
-        match worker.submit(ReferenceJob { generation, kind }) {
+        let commit = Arc::new(ReferenceCommit::default());
+        match worker.submit(ReferenceJob {
+            generation,
+            kind,
+            commit: Some(Arc::clone(&commit)),
+        }) {
             Ok(()) => {
+                if let Some(previous) = self.reference_commit.replace(commit) {
+                    previous.cancel();
+                }
                 self.reference_generation = generation;
                 self.state.clear_warning(WarningSource::Command);
-                if let Some(sequence) = candidate_sequence {
-                    self.in_flight_candidate = Some((sequence, generation));
-                }
+                self.in_flight_candidate =
+                    candidate_sequence.map(|sequence| (sequence, generation));
                 true
             }
             Err(error) => {
@@ -2077,7 +2168,16 @@ impl<P: RuntimePorts> RuntimeEngine<P> {
             {
                 self.in_flight_candidate = None;
             }
-            if result.generation != self.reference_generation {
+            // A successful replacement is already durable. Reconcile it even when
+            // cancellation arrived after the commit claim; otherwise disk and runtime diverge.
+            let persisted_here = result.result.is_ok()
+                && result.persisted_path.as_deref()
+                    == Some(std::path::Path::new(
+                        &self.state.config.reference_image_path,
+                    ));
+            if result.persisted_path.is_some() && !persisted_here && result.result.is_ok()
+                || result.generation != self.reference_generation && !persisted_here
+            {
                 self.state.record(format!(
                     "Ignored obsolete reference result {}",
                     result.generation
@@ -2095,13 +2195,12 @@ impl<P: RuntimePorts> RuntimeEngine<P> {
                             .reference_candidate
                             .as_ref()
                             .is_some_and(|candidate| candidate.sequence == frame_sequence);
-                        if !candidate_matches {
-                            self.state
-                                .record("Ignored reference result for a replaced review candidate");
-                            continue;
+                        if candidate_matches {
+                            self.state.take_reference_candidate();
                         }
-                        self.state.take_reference_candidate();
-                    } else if result.action == ReferenceAction::Import {
+                    } else if result.action == ReferenceAction::Import
+                        && result.generation == self.reference_generation
+                    {
                         self.state.discard_reference_candidate();
                     }
                     self.state
@@ -2296,7 +2395,6 @@ impl<T> CoalescingSlot<T> {
             .and_then(|mut pending| pending.take())
     }
 
-    #[cfg(windows)]
     fn wait_take(&self, stop: &StdAtomicBool) -> Option<T> {
         let mut pending = self
             .pending
@@ -2321,8 +2419,13 @@ impl<T> CoalescingSlot<T> {
         }
     }
 
-    #[cfg(windows)]
-    fn wake(&self) {
+    /// Changes the stop predicate under the waiter's mutex, preventing lost wakes.
+    fn stop(&self, stop: &StdAtomicBool) {
+        let _pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        stop.store(true, StdOrdering::Release);
         self.changed.notify_all();
     }
 }
@@ -2394,8 +2497,7 @@ impl MonitorScanWorker {
     }
 
     fn signal_shutdown(&self) {
-        self.stop.store(true, Ordering::Release);
-        self.pending.wake();
+        self.pending.stop(&self.stop);
     }
 
     fn finish_shutdown(&mut self) {
@@ -2472,8 +2574,7 @@ impl VideoDeviceWorker {
     }
 
     fn signal_shutdown(&self) {
-        self.stop.store(true, Ordering::Release);
-        self.pending.wake();
+        self.pending.stop(&self.stop);
     }
 
     fn finish_shutdown(&mut self) {
@@ -2491,6 +2592,11 @@ impl Drop for VideoDeviceWorker {
     }
 }
 
+#[cfg(any(windows, test))]
+fn monitor_color_allows_matching(color: Result<bool, String>) -> bool {
+    matches!(color, Ok(false))
+}
+
 #[cfg(windows)]
 fn scan_monitors(request: MonitorScanRequest, stop: &AtomicBool) -> MonitorScanResult {
     let active = &request.capture_active;
@@ -2506,7 +2612,10 @@ fn scan_monitors(request: MonitorScanRequest, stop: &AtomicBool) -> MonitorScanR
                 .take_while(|_| active.load(Ordering::Acquire) && !stop.load(Ordering::Acquire))
                 .map(|monitor| {
                     let mut capture = WindowsGraphicsScreenInput::default();
-                    let valid = capture.start(&monitor, request.cursor_visible).is_ok();
+                    // Unverified and unsupported color cannot participate in reference matching.
+                    let valid = monitor_color_allows_matching(
+                        capture.display_uses_hdr_or_ten_bit(&monitor),
+                    ) && capture.start(&monitor, request.cursor_visible).is_ok();
                     let deadline = Instant::now() + Duration::from_millis(750);
                     let frame = valid
                         .then(|| {
@@ -4447,6 +4556,7 @@ mod tests {
             reference_worker: None,
             reference_generation: 0,
             in_flight_candidate: None,
+            reference_commit: None,
             last_deadline_log: now - Duration::from_secs(30),
         }
     }
@@ -4489,6 +4599,125 @@ mod tests {
             label: label.into(),
             ..MonitorDescriptor::default()
         }
+    }
+
+    #[test]
+    fn flow_discovery_shutdown_serializes_with_wait_and_wakes_idle_workers() {
+        let slot = Arc::new(CoalescingSlot::<()>::new());
+        let stop = Arc::new(StdAtomicBool::new(false));
+        let guard = slot.pending.lock().unwrap();
+        let (started_tx, started_rx) = std_mpsc::sync_channel(0);
+        let (done_tx, done_rx) = std_mpsc::sync_channel(0);
+        let producer_slot = Arc::clone(&slot);
+        let producer_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            producer_slot.stop(&producer_stop);
+            done_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        assert!(!stop.load(StdOrdering::Acquire));
+        let (guard, timeout) = slot
+            .changed
+            .wait_timeout_while(guard, Duration::from_secs(2), |_| {
+                !stop.load(StdOrdering::Acquire)
+            })
+            .unwrap();
+        assert!(!timeout.timed_out());
+        drop(guard);
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(slot.wait_take(&stop), None);
+    }
+
+    #[test]
+    fn contract_monitor_matching_requires_verified_sdr() {
+        assert!(monitor_color_allows_matching(Ok(false)));
+        assert!(!monitor_color_allows_matching(Ok(true)));
+        assert!(!monitor_color_allows_matching(Err(
+            "display query failed".into()
+        )));
+    }
+
+    #[test]
+    fn flow_reference_cancellation_preserves_disk_and_late_commit_updates_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reference.png");
+        let now = Instant::now();
+        let original = scripted_solid_frame(PIPELINE_SIZE, 0xff000000, 1, now);
+        let candidate = scripted_solid_frame(PIPELINE_SIZE, 0xffffffff, 2, now);
+        persist_frame_atomic(&original, &path).unwrap();
+        let mut state = running_scripted_state(now);
+        state.config.reference_image_path = path.display().to_string();
+        let mut engine = scripted_engine(state, ScriptedRuntimePorts::default(), now);
+        let commit = Arc::new(ReferenceCommit::default());
+        engine.reference_commit = Some(Arc::clone(&commit));
+        engine.in_flight_candidate = Some((candidate.sequence, 1));
+        engine
+            .state
+            .stage_reference_candidate(Arc::clone(&candidate));
+        assert!(engine.command(Command::DiscardReferenceCandidate));
+        assert!(commit.is_cancelled());
+        assert!(engine.state.snapshot.previews.reference_candidate.is_none());
+        let cancelled = execute_reference_job(ReferenceJob {
+            generation: 1,
+            commit: Some(commit),
+            kind: ReferenceJobKind::Persist {
+                frame: Arc::clone(&candidate),
+                path: path.clone(),
+                confirmed: true,
+            },
+        });
+        assert!(cancelled.result.is_err());
+        assert_eq!(
+            image::open(&path).unwrap().to_rgba8().get_pixel(0, 0).0,
+            [0, 0, 0, 255]
+        );
+        assert!(!pending_reference_path(&path).exists());
+
+        // Once replacement is claimed, cancellation cannot undo a committed save.
+        let commit = Arc::new(ReferenceCommit::default());
+        commit.claim().unwrap();
+        commit.cancel();
+        let committed = execute_reference_job(ReferenceJob {
+            generation: 1,
+            commit: Some(commit),
+            kind: ReferenceJobKind::Persist {
+                frame: candidate,
+                path: path.clone(),
+                confirmed: true,
+            },
+        });
+        assert!(committed.result.is_ok());
+        let (result_sender, results) = std_mpsc::sync_channel(1);
+        let (_done_sender, done) = std_mpsc::sync_channel(1);
+        engine.reference_worker = Some(ReferenceWorker {
+            jobs: None,
+            results,
+            stop: Arc::new(StdAtomicBool::new(false)),
+            done,
+            worker: None,
+        });
+        engine.reference_generation = 2;
+        result_sender.send(committed).ok().unwrap();
+        engine.poll_reference_results(now);
+        assert!(engine.state.reference.is_some());
+        assert_eq!(
+            &engine
+                .state
+                .snapshot
+                .previews
+                .reference
+                .as_ref()
+                .unwrap()
+                .pixels()[..4],
+            &[255; 4]
+        );
+        assert_eq!(
+            image::open(&path).unwrap().to_rgba8().get_pixel(0, 0).0,
+            [255; 4]
+        );
     }
 
     #[test]
@@ -4984,6 +5213,7 @@ mod tests {
             worker: None,
         };
         let job = || ReferenceJob {
+            commit: None,
             generation: 1,
             kind: ReferenceJobKind::Load {
                 path: std::path::PathBuf::from("unused-reference.png"),
@@ -5014,6 +5244,7 @@ mod tests {
                     .unwrap()
                     .send(ReferenceJob {
                         generation,
+                        commit: None,
                         kind: ReferenceJobKind::Load {
                             path: directory.path().join("missing.png"),
                         },
@@ -5089,6 +5320,7 @@ mod tests {
 
         result_sender
             .send(ReferenceResult {
+                persisted_path: None,
                 generation: 1,
                 action: ReferenceAction::Load,
                 result: Ok(data),
@@ -5108,6 +5340,7 @@ mod tests {
         let current_data = reference_data_from_frame(&frame).unwrap();
         result_sender
             .send(ReferenceResult {
+                persisted_path: None,
                 generation: 2,
                 action: ReferenceAction::Load,
                 result: Ok(current_data),
@@ -5128,6 +5361,7 @@ mod tests {
         assert!(engine.platform.reference_updates.last().unwrap().is_some());
         result_sender
             .send(ReferenceResult {
+                persisted_path: None,
                 generation: 2,
                 action: ReferenceAction::Load,
                 result: Err("reference was removed".into()),
@@ -5687,6 +5921,7 @@ mod tests {
             let destination = directory.path().join("reference.png");
             rgba.save(&source).unwrap();
             let result = execute_reference_job(ReferenceJob {
+                commit: None,
                 generation: 1,
                 kind: ReferenceJobKind::Import {
                     source,

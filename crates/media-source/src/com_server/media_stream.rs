@@ -1,7 +1,10 @@
 use super::OBJECTS;
 use super::diagnostics;
 use super::pipe_reader::PipeReader;
-use stageswap_core::{PIPELINE_SIZE, SharedFrameCache, off_frame_pixels};
+use stageswap_core::{
+    CAPTURE_FRAME_POOL_CAPACITY, Frame, FrameBufferPool, PIPELINE_SIZE, SharedFrameCache,
+    off_frame_pixels,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -130,11 +133,22 @@ pub(super) struct StreamCheckpoint {
     state: MF_STREAM_STATE,
 }
 
-#[derive(Default)]
 struct Nv12Cache {
-    converted: Option<(u64, GUID, Arc<[u8]>)>,
+    converted: Option<(Arc<Frame>, Arc<[u8]>)>,
+    pool: FrameBufferPool,
     #[cfg(test)]
     conversions: u64,
+}
+
+impl Default for Nv12Cache {
+    fn default() -> Self {
+        Self {
+            converted: None,
+            pool: FrameBufferPool::new(NV12_FRAME_BYTES as usize, CAPTURE_FRAME_POOL_CAPACITY),
+            #[cfg(test)]
+            conversions: 0,
+        }
+    }
 }
 
 #[implement(IMFMediaStream2)]
@@ -301,18 +315,23 @@ impl MediaStream {
         Ok((sample, free_samples))
     }
 
-    fn nv12_frame(&self, sequence: u64, bgra: &[u8]) -> Arc<[u8]> {
+    /// Keys conversion by the immutable frame object, including across pipe reconnects.
+    fn nv12_frame(&self, frame: &Arc<Frame>) -> Arc<[u8]> {
         let mut cache = self.nv12_cache.lock().expect("NV12 cache lock poisoned");
-        if let Some((cached_sequence, cached_subtype, bytes)) = &cache.converted
-            && *cached_sequence == sequence
-            && *cached_subtype == MFVideoFormat_NV12
+        if let Some((cached_frame, bytes)) = &cache.converted
+            && Arc::ptr_eq(cached_frame, frame)
         {
             return Arc::clone(bytes);
         }
-        let mut bytes = vec![0; NV12_FRAME_BYTES as usize];
-        bgra_to_nv12(&mut bytes, bgra);
-        let bytes: Arc<[u8]> = bytes.into();
-        cache.converted = Some((sequence, MFVideoFormat_NV12, Arc::clone(&bytes)));
+        cache.converted = None;
+        let bytes = cache
+            .pool
+            .write_with_fallback(|bytes| {
+                bgra_to_nv12(bytes, frame.pixels());
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap();
+        cache.converted = Some((Arc::clone(frame), Arc::clone(&bytes)));
         #[cfg(test)]
         {
             cache.conversions = cache.conversions.saturating_add(1);
@@ -398,6 +417,9 @@ impl MediaStream {
         if let Ok(mut frames) = self.frames.lock() {
             frames.invalidate();
         }
+        if let Ok(mut cache) = self.nv12_cache.lock() {
+            *cache = Nv12Cache::default();
+        }
         if let Ok(mut allocator) = self.sample_allocator.lock()
             && let Some(allocator) = allocator.allocator.take()
         {
@@ -441,9 +463,7 @@ impl MediaStream {
             return Err(Error::from_hresult(MF_E_INVALIDREQUEST));
         };
         let converted_nv12 = if format == BufferFormat::Nv12 {
-            live_frame
-                .as_ref()
-                .map(|frame| self.nv12_frame(frame.sequence, frame.pixels()))
+            live_frame.as_ref().map(|frame| self.nv12_frame(frame))
         } else {
             None
         };
@@ -856,10 +876,15 @@ mod tests {
         unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL)? };
         let _foundation = MediaFoundation;
         let stream = MediaStream::new(r"\\.\pipe\StageSwap.Nonexistent.CacheTest".into())?;
-        let bgra = off_frame_pixels();
-
-        let first = stream.nv12_frame(7, &bgra);
-        let second = stream.nv12_frame(7, &bgra);
+        let frame = Arc::new(Frame::placeholder(
+            PIPELINE_SIZE,
+            0xff000000,
+            7,
+            0,
+            std::time::Instant::now(),
+        ));
+        let first = stream.nv12_frame(&frame);
+        let second = stream.nv12_frame(&frame);
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(
             stream
@@ -869,15 +894,30 @@ mod tests {
                 .conversions,
             1
         );
-        let third = stream.nv12_frame(8, &bgra);
-        assert!(!Arc::ptr_eq(&second, &third));
+        // A new connection may reuse sequence 7 for different pixels.
+        let replacement = Arc::new(Frame::placeholder(
+            PIPELINE_SIZE,
+            0xffffffff,
+            7,
+            0,
+            std::time::Instant::now(),
+        ));
+        let third = stream.nv12_frame(&replacement);
+        assert_ne!(first.as_ref(), third.as_ref());
+        let pointer = first.as_ptr();
+        drop(first);
+        drop(second);
+        let next = stream.nv12_frame(&frame);
+        assert_eq!(next.as_ptr(), pointer);
+        assert_eq!(stream.nv12_cache.lock().unwrap().pool.allocated_slots(), 2);
+        assert!(!Arc::ptr_eq(&next, &third));
         assert_eq!(
             stream
                 .nv12_cache
                 .lock()
                 .expect("NV12 cache lock poisoned")
                 .conversions,
-            2
+            3
         );
         Ok(())
     }

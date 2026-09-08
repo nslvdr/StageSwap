@@ -173,10 +173,6 @@ pub fn aspect_fit_bgra_into(
         return Ok(());
     }
 
-    destination.fill(0);
-    for alpha in destination.iter_mut().skip(3).step_by(4) {
-        *alpha = 0xff;
-    }
     let scale = f64::min(
         output.width as f64 / source_size.width as f64,
         output.height as f64 / source_size.height as f64,
@@ -185,6 +181,23 @@ pub fn aspect_fit_bgra_into(
     let height = (source_size.height as f64 * scale).round().max(1.0) as u32;
     let x_offset = (output.width - width) / 2;
     let y_offset = (output.height - height) / 2;
+    // Only the letterbox survives scaling; every image pixel is overwritten below.
+    if width != output.width || height != output.height {
+        for (y, row) in destination
+            .chunks_exact_mut(output_stride as usize)
+            .enumerate()
+        {
+            let (left, right) = if y < y_offset as usize || y >= (y_offset + height) as usize {
+                (row, &mut [][..])
+            } else {
+                let (left, image_and_right) = row.split_at_mut(x_offset as usize * 4);
+                (left, &mut image_and_right[width as usize * 4..])
+            };
+            for pixel in left.chunks_exact_mut(4).chain(right.chunks_exact_mut(4)) {
+                pixel.copy_from_slice(&[0, 0, 0, 255]);
+            }
+        }
+    }
     let source_x_step = u64::from(source_size.width / width);
     let source_x_increment = u64::from(source_size.width % width);
     let source_y_step = u64::from(source_size.height / height);
@@ -978,6 +991,48 @@ mod tests {
             "centered app icon has only {branded_pixels} visible pixels"
         );
         assert!(first.pixels().chunks_exact(4).all(|pixel| pixel[3] == 0xff));
+    }
+
+    #[test]
+    fn contract_reused_normalization_fills_only_borders_and_replaces_old_pixels() {
+        let mut destination = vec![99; 4 * 4 * 4];
+        // Padded rows and non-opaque input expose accidental padding/alpha changes.
+        let mut source = vec![123; 20 * 2];
+        for row in source.chunks_exact_mut(20) {
+            for pixel in row[..16].chunks_exact_mut(4) {
+                pixel.copy_from_slice(&[1, 2, 3, 77]);
+            }
+        }
+        aspect_fit_bgra_into(
+            &source,
+            Size::new(4, 2),
+            20,
+            &mut destination,
+            Size::new(4, 4),
+        )
+        .unwrap();
+        for (y, row) in destination.chunks_exact(16).enumerate() {
+            let expected = if y == 0 || y == 3 {
+                [0, 0, 0, 255]
+            } else {
+                [1, 2, 3, 77]
+            };
+            assert!(row.chunks_exact(4).all(|pixel| pixel == expected));
+        }
+        let full = [9, 8, 7, 66].repeat(8 * 8);
+        aspect_fit_bgra_into(
+            &full,
+            Size::new(8, 8),
+            32,
+            &mut destination,
+            Size::new(4, 4),
+        )
+        .unwrap();
+        assert!(
+            destination
+                .chunks_exact(4)
+                .all(|pixel| pixel == [9, 8, 7, 66])
+        );
     }
 
     #[test]

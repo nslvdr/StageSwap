@@ -13,6 +13,10 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo,
     GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
 };
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_STAGING, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
+};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame as CaptureFrame;
@@ -150,10 +154,50 @@ impl ProcessingFailureStreak {
 struct CaptureHandler {
     shared: Arc<Shared>,
     expected_generation: u64,
-    scratch: Vec<u8>,
+    staging: Option<(D3D11_TEXTURE2D_DESC, ID3D11Texture2D)>,
     pool: FrameBufferPool,
     pacer: Option<FramePacer>,
     processing_failures: ProcessingFailureStreak,
+}
+
+/// Keeps the staging resource mapped only while normalization reads its rows.
+struct MappedScreen<'a> {
+    context: &'a ID3D11DeviceContext,
+    texture: &'a ID3D11Texture2D,
+}
+
+impl Drop for MappedScreen<'_> {
+    fn drop(&mut self) {
+        // SAFETY: constructed only after Map succeeds, with both interfaces retained.
+        unsafe { self.context.Unmap(self.texture, 0) };
+    }
+}
+
+/// Captures keep one staging texture per geometry/format, owned by their handler.
+fn screen_staging(
+    staging: &mut Option<(D3D11_TEXTURE2D_DESC, ID3D11Texture2D)>,
+    device: &ID3D11Device,
+    source_desc: &D3D11_TEXTURE2D_DESC,
+) -> Result<ID3D11Texture2D, String> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+        ..*source_desc
+    };
+    if let Some((previous, texture)) = staging
+        && *previous == desc
+    {
+        return Ok(texture.clone());
+    }
+    let mut texture = None;
+    // SAFETY: the capture device is live and desc describes a CPU-readable copy.
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
+        .map_err(|error| format!("could not create screen staging texture: {error}"))?;
+    let texture = texture.ok_or("screen staging texture was not created")?;
+    *staging = Some((desc, texture.clone()));
+    Ok(texture)
 }
 
 impl GraphicsCaptureApiHandler for CaptureHandler {
@@ -164,7 +208,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
         Ok(Self {
             shared: context.flags.shared,
             expected_generation: context.flags.expected_generation,
-            scratch: Vec::new(),
+            staging: None,
             pool: FrameBufferPool::new(
                 (PIPELINE_SIZE.width * PIPELINE_SIZE.height * 4) as usize,
                 CAPTURE_FRAME_POOL_CAPACITY,
@@ -194,8 +238,28 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
             let timestamp = frame.timestamp().map_or(0, |time| time.Duration);
             let width = frame.width();
             let height = frame.height();
-            let buffer = frame.buffer().map_err(|error| error.to_string())?;
-            let pixels = buffer.as_nopadding_buffer(&mut self.scratch);
+            let texture = screen_staging(&mut self.staging, frame.device(), frame.desc())?;
+            let context = frame.device_context();
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            // SAFETY: the staging texture matches the source and is not mapped yet.
+            unsafe {
+                context.CopyResource(&texture, frame.as_raw_texture());
+                context.Map(&texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            }
+            .map_err(|error| format!("could not map screen staging texture: {error}"))?;
+            let _mapping = MappedScreen {
+                context,
+                texture: &texture,
+            };
+            let length = (mapped.RowPitch as usize)
+                .checked_mul(height as usize)
+                .filter(|length| *length <= isize::MAX as usize)
+                .ok_or("screen mapped buffer size overflowed")?;
+            if mapped.pData.is_null() {
+                return Err("screen mapped buffer is null".into());
+            }
+            // SAFETY: Map exposes RowPitch * height readable bytes until _mapping drops.
+            let pixels = unsafe { std::slice::from_raw_parts(mapped.pData.cast(), length) };
             let previous_exhaustions = self.pool.exhaustion_count();
             let pixels = self
                 .pool
@@ -203,7 +267,7 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
                     aspect_fit_bgra_into(
                         pixels,
                         Size::new(width, height),
-                        width * 4,
+                        mapped.RowPitch,
                         destination,
                         PIPELINE_SIZE,
                     )
@@ -444,6 +508,99 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn native_screen_staging_reuses_textures_and_reads_pitched_rows() {
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
+            D3D11_USAGE_DEFAULT, D3D11CreateDevice,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        let mut device = None;
+        let mut context = None;
+        // SAFETY: initializes owned test-only WARP interfaces through writable outputs.
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )
+        }
+        .unwrap();
+        let device = device.unwrap();
+        let context = context.unwrap();
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: 3,
+            Height: 2,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            ..Default::default()
+        };
+        let pixels = [1, 2, 3, 255].repeat(6);
+        let initial = D3D11_SUBRESOURCE_DATA {
+            pSysMem: pixels.as_ptr().cast(),
+            SysMemPitch: 12,
+            SysMemSlicePitch: 24,
+        };
+        let mut source = None;
+        // SAFETY: initial pixels cover every row of the single-subresource texture.
+        unsafe { device.CreateTexture2D(&desc, Some(&initial), Some(&mut source)) }.unwrap();
+        let source = source.unwrap();
+        let mut staging = None;
+        let texture = screen_staging(&mut staging, &device, &desc).unwrap();
+        assert_eq!(
+            texture,
+            screen_staging(&mut staging, &device, &desc).unwrap()
+        );
+        for _ in 0..2 {
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            // SAFETY: matching live resources; the previous iteration has unmapped staging.
+            unsafe {
+                context.CopyResource(&texture, &source);
+                context.Map(&texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            }
+            .unwrap();
+            let _mapping = MappedScreen {
+                context: &context,
+                texture: &texture,
+            };
+            // SAFETY: staging remains mapped for the full read and normalization.
+            let rows = unsafe {
+                std::slice::from_raw_parts(mapped.pData.cast(), mapped.RowPitch as usize * 2)
+            };
+            let mut output = vec![0; 24];
+            aspect_fit_bgra_into(
+                rows,
+                Size::new(3, 2),
+                mapped.RowPitch,
+                &mut output,
+                Size::new(3, 2),
+            )
+            .unwrap();
+            assert_eq!(output, pixels);
+        }
+        let resized = D3D11_TEXTURE2D_DESC { Width: 4, ..desc };
+        assert_ne!(
+            texture,
+            screen_staging(&mut staging, &device, &resized).unwrap()
+        );
     }
 
     #[test]

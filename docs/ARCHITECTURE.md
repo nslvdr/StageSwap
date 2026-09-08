@@ -20,7 +20,7 @@ Screen thumbnail ─ compare with reference ─ debounce ─ source choice ┘
 
 The internal and published contract is immutable CPU BGRA at 1280×720 and 30 fps.
 
-1. Windows Graphics Capture copies each transient D3D texture into a staging texture and then into a CPU `Frame`.
+1. Windows Graphics Capture reuses one staging texture per capture geometry/format. It reads mapped pitched rows directly into the normalized CPU `Frame`, without a full-resolution scratch copy, and unmaps on every exit path. Aspect-fit normalization initializes only letterbox pixels before sampling the image area.
 2. Media Foundation ranks progressive RGB32, NV12, YUY2, and MJPEG webcam modes, comparing rational frame rates without truncation. It prefers RGB32 1280×720 at 30 fps, honors actual row pitch, and decimates higher-rate callbacks before buffer access so normalization never intentionally exceeds 30 fps.
 3. Optional webcam cropping uses the native display aspect ratio to center-crop and normalize directly into the fixed 16:9 frame during capture. Native 16:9 and unknown-aspect input uses aspect-fit instead. Preview and output therefore consume the same capture-normalized frame without a second crop pass.
 4. Detection derives a 160×90 grayscale image from the screen every 250 ms. Five matches select the webcam; three mismatches select the screen. Still-image PIP is enabled by default: in Auto, it requires both sources and exact consecutive non-reference thumbnails for the configured delay (30/45/60/120/300 seconds; default 45). Paused video counts as still content. Motion, reference return, near-black input, source loss, or manual mode resets the detector.
@@ -31,7 +31,7 @@ The internal and published contract is immutable CPU BGRA at 1280×720 and 30 fp
 
 `RuntimeEngine::step(now)` owns timing and state transitions. Production supplies a monotonic clock and Windows adapters; deterministic tests use a virtual clock and scripted component ports.
 
-The runtime mailbox is bounded. It processes at most eight ordered commands per output cycle, coalesces settings and output-mode changes as last-wins values, and gives shutdown an independent signal. Settings supersede older mode commands; device batches preserve discard-before-capture ordering and cancel captures superseded by a discard. The reference worker retains completed results under bounded queue pressure and remains interruptible during shutdown.
+The runtime mailbox is bounded. It processes at most eight ordered commands per output cycle, coalesces settings and output-mode changes as last-wins values, and gives shutdown an independent signal. Settings supersede older mode commands; device batches preserve discard-before-capture ordering and cancel captures superseded by a discard. The reference worker retains completed results under bounded queue pressure and remains interruptible during shutdown. Discovery-worker shutdown changes its stop predicate under the condition-variable mutex so an idle worker cannot miss the wake-up.
 
 The named-pipe publisher retains only the newest header and shared pixel buffer, so a slow consumer cannot build a queue or force another full-frame clone.
 
@@ -55,7 +55,7 @@ Device invalidation, driver failure, and stale capture retry the saved webcam af
 
 Monitor descriptors include the GDI display name, friendly label, geometry, and runtime-only monitor handle. Startup restores the first exact friendly-label match, otherwise the first non-primary display, or the sole primary display when no secondary exists.
 
-Reference discovery scans without pausing output. It runs at startup, when Settings opens, after reference changes, every 30 seconds by default, and on explicit rescan. The same highest-scoring display above the threshold must win twice. Disabling automatic scans cancels unfinished automatic results but leaves explicit rescans available.
+Reference discovery scans without pausing output. It runs at startup, when Settings opens, after reference changes, every 30 seconds by default, and on explicit rescan. Only displays verified as SDR/8-bit participate in reference scoring; unsupported displays and failed color-capability queries are excluded. The same highest-scoring eligible display above the threshold must win twice. Disabling automatic scans cancels unfinished automatic results but leaves explicit rescans available.
 
 Selected-screen recovery is independent of discovery. Every 30 seconds it checks only the selected capture. Two consecutive missing or near-black checks restart that capture; any valid non-black check clears the confirmation. Recovery retains the stored display identity and never enumerates or selects a replacement monitor.
 
@@ -69,7 +69,7 @@ Stream shutdown marks the stream stopped, cancels and joins its synchronous pipe
 
 Virtual-camera and all-component restarts recreate a missing or failed frame publisher before restarting the camera controller. Source startup announces its stream before queuing `MESourceStarted`.
 
-The Media Foundation source prefers RGB32 1280×720 at 30 fps and exposes NV12 720p for Windows Camera and Zoom compatibility. NV12 uses limited-range BT.601 metadata and caches one conversion per immutable publisher sequence. 1080p is intentionally excluded.
+The Media Foundation source prefers RGB32 1280×720 at 30 fps and exposes NV12 720p for Windows Camera and Zoom compatibility. NV12 uses limited-range BT.601 metadata and caches one conversion per immutable received frame object, so reused sequence numbers after reconnect cannot reuse old pixels. Conversion uses a bounded four-slot buffer pool with a temporary fallback under pressure; the cache and pool are released at stream shutdown. 1080p is intentionally excluded.
 
 Requested samples are timestamped from the current QPC-correlated Media Foundation clock. When the publisher is disconnected, invalid, or stale, the source generates the canonical black off frame with the centered StageSwap icon. The running app publishes that same frame at 30 fps while automatic switching is stopped.
 
@@ -94,7 +94,9 @@ Updates use the public GitHub Releases API, checked once at startup and on deman
 
 ## Persistence, diagnostics, and administration
 
-Configuration schema 1, `reference.png`, update-notification state, and JSONL logs live below `%LocalAppData%\StageSwap`. Configuration and reference replacement use validation, backup, writable flushes, and atomic replacement. Only a valid primary configuration can replace the configuration backup, preserving recovery after a failed save of settings loaded from that backup. Logs retain errors, warnings, recovery outcomes, and infrequent lifecycle states for 14 days by default. Verbose logging adds recurring telemetry only for new activity.
+Configuration schema 1, `reference.png`, update-notification state, and JSONL logs live below `%LocalAppData%\StageSwap`. Configuration and reference replacement use validation, backup, writable flushes, and atomic replacement. Only a valid primary configuration can replace the configuration backup, preserving recovery after a failed save of settings loaded from that backup. Routine settings saves run on a dedicated writer with one last-wins pending configuration and one completion slot; UI refreshes never wait for its disk I/O. Explicit admin restore first drains older settings writes (up to two seconds, aborting restore on timeout), and exit drains the final settings within the same bounded timeout. A timed-out writer is detached without starting a competing synchronous write. Reference cancellation and final replacement compete for an atomic commit claim. Cancellation before the claim leaves the saved reference untouched. Once replacement is claimed, successful completion for the current reference path updates the runtime even if the review candidate has since been discarded or superseded, keeping disk and memory consistent.
+
+Logs retain errors, warnings, recovery outcomes, and infrequent lifecycle states for 14 days by default. Verbose logging adds recurring telemetry only for new activity.
 
 Critical runtime and configuration notifications are structured at the runtime boundary, delivered to a session-only in-app notification center, and shown as brief in-app toasts. They are not persisted or sent through native Windows notifications. Update availability remains separately deduplicated per channel in `update-state.json` and is presented as an informational in-app notification when enabled.
 
