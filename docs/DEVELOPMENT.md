@@ -1,6 +1,6 @@
 # Development
 
-This guide covers local engineering, deterministic UI review, Windows validation, packaging, and releases. Product usage belongs in the [StageSwap wiki](https://github.com/NatanSlvdr/StageSwap/wiki); agent-specific operating guidance remains in [`AGENTS.md`](../AGENTS.md).
+This guide covers local engineering, deterministic UI review, Windows validation, packaging, and releases. Product usage belongs in the [StageSwap wiki](https://github.com/nslvdr/StageSwap/wiki); agent-specific operating guidance remains in [`AGENTS.md`](../AGENTS.md).
 
 ## Prerequisites and workspace
 
@@ -102,4 +102,4 @@ Never use the publisher merely to test a documentation or packaging change: it c
 
 ## Contribution and reporting policy
 
-See the [README](../README.md#development) for contribution policy. Report reproducible problems through [GitHub issues](https://github.com/NatanSlvdr/StageSwap/issues) with the StageSwap and Windows versions, selected device types, reproduction steps, expected and actual behavior, and reviewed diagnostic logs when relevant. Do not attach camera or display frames without checking them for private content.
+See the [README](../README.md#development) for contribution policy. Report reproducible problems through [GitHub issues](https://github.com/nslvdr/StageSwap/issues) with the StageSwap and Windows versions, selected device types, reproduction steps, expected and actual behavior, and reviewed diagnostic logs when relevant. Do not attach camera or display frames without checking them for private content.

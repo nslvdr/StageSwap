@@ -247,8 +247,8 @@ fn preflight_repository(workspace: &Path) -> Result<()> {
         bail!("publish-release requires a clean worktree");
     }
     let remote = capture(git(workspace, &["remote", "get-url", "origin"]))?;
-    if !remote.contains("NatanSlvdr/StageSwap") {
-        bail!("origin does not point to NatanSlvdr/StageSwap");
+    if !remote.contains("nslvdr/StageSwap") {
+        bail!("origin does not point to nslvdr/StageSwap");
     }
     run(git(workspace, &["fetch", "origin"]))?;
     let head = capture(git(workspace, &["rev-parse", "HEAD"]))?;
@@ -402,7 +402,7 @@ fn published_versions() -> Result<Vec<ReleaseVersion>> {
             "release",
             "list",
             "--repo",
-            "NatanSlvdr/StageSwap",
+            "nslvdr/StageSwap",
             "--limit",
             "100",
             "--json",
@@ -428,7 +428,7 @@ fn incomplete_draft_exists(tag: &str) -> Result<bool> {
         "view",
         tag,
         "--repo",
-        "NatanSlvdr/StageSwap",
+        "nslvdr/StageSwap",
         "--json",
         "isDraft",
         "--jq",
@@ -463,7 +463,7 @@ fn cleanup_incomplete_draft(tag: &str) -> Result<()> {
         "delete",
         tag,
         "--repo",
-        "NatanSlvdr/StageSwap",
+        "nslvdr/StageSwap",
         "--yes",
         "--cleanup-tag",
     ]);
@@ -519,7 +519,7 @@ fn publish_github_release(
         artifact.to_str().context("artifact path is not UTF-8")?,
         checksum.to_str().context("checksum path is not UTF-8")?,
         "--repo",
-        "NatanSlvdr/StageSwap",
+        "nslvdr/StageSwap",
         "--target",
         revision,
         "--title",

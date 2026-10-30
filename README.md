@@ -9,14 +9,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/NatanSlvdr/StageSwap/releases/latest"><strong>Download StageSwap</strong></a>
+  <a href="https://github.com/nslvdr/StageSwap/releases/latest"><strong>Download StageSwap</strong></a>
   ·
-  <a href="https://github.com/NatanSlvdr/StageSwap/wiki">User guide</a>
+  <a href="https://github.com/nslvdr/StageSwap/wiki">User guide</a>
   ·
-  <a href="https://github.com/NatanSlvdr/StageSwap/wiki/Troubleshooting">Troubleshooting</a>
+  <a href="https://github.com/nslvdr/StageSwap/wiki/Troubleshooting">Troubleshooting</a>
 </p>
 
-![StageSwap dashboard showing webcam, secondary-screen, reference-image, and Zoom-output previews](https://raw.githubusercontent.com/wiki/NatanSlvdr/StageSwap/assets/dashboard-auto-camera.png)
+![StageSwap dashboard showing webcam, secondary-screen, reference-image, and Zoom-output previews](https://raw.githubusercontent.com/wiki/nslvdr/StageSwap/assets/dashboard-auto-camera.png)
 
 ## What StageSwap does
 
@@ -45,7 +45,7 @@ Anything visible on the selected secondary screen can appear in Zoom, including 
 - A secondary screen used for JW Library presentations
 - Zoom with permission to use a camera
 
-Current releases are unsigned. Download only from the [official releases page](https://github.com/NatanSlvdr/StageSwap/releases/latest).
+Current releases are unsigned. Download only from the [official releases page](https://github.com/nslvdr/StageSwap/releases/latest).
 
 ## Get started
 
@@ -57,24 +57,24 @@ Current releases are unsigned. Download only from the [official releases page](h
 
 Windows may request administrator approval when the virtual camera must be installed or updated. Normal managed launches run without administrator access.
 
-For screenshots, detailed instructions, and a setup success checklist, follow the [complete setup guide](https://github.com/NatanSlvdr/StageSwap/wiki/Setup).
+For screenshots, detailed instructions, and a setup success checklist, follow the [complete setup guide](https://github.com/nslvdr/StageSwap/wiki/Setup).
 
 ## Documentation
 
 | I want to… | Read… |
 | --- | --- |
-| Install and configure StageSwap | [Setup](https://github.com/NatanSlvdr/StageSwap/wiki/Setup) |
-| Prepare for and run a meeting | [Meetings](https://github.com/NatanSlvdr/StageSwap/wiki/Meetings) |
-| Understand previews and controls | [Dashboard](https://github.com/NatanSlvdr/StageSwap/wiki/Dashboard) |
-| Change devices or preferences | [Settings](https://github.com/NatanSlvdr/StageSwap/wiki/Settings) |
-| Fix a problem | [Troubleshooting](https://github.com/NatanSlvdr/StageSwap/wiki/Troubleshooting) |
-| Update, clean up, or uninstall | [Updates](https://github.com/NatanSlvdr/StageSwap/wiki/Updates) |
-| Understand local data and privacy | [Privacy](https://github.com/NatanSlvdr/StageSwap/wiki/Privacy) |
-| Check exact behavior and limits | [Technical reference](https://github.com/NatanSlvdr/StageSwap/wiki/Technical-reference) |
+| Install and configure StageSwap | [Setup](https://github.com/nslvdr/StageSwap/wiki/Setup) |
+| Prepare for and run a meeting | [Meetings](https://github.com/nslvdr/StageSwap/wiki/Meetings) |
+| Understand previews and controls | [Dashboard](https://github.com/nslvdr/StageSwap/wiki/Dashboard) |
+| Change devices or preferences | [Settings](https://github.com/nslvdr/StageSwap/wiki/Settings) |
+| Fix a problem | [Troubleshooting](https://github.com/nslvdr/StageSwap/wiki/Troubleshooting) |
+| Update, clean up, or uninstall | [Updates](https://github.com/nslvdr/StageSwap/wiki/Updates) |
+| Understand local data and privacy | [Privacy](https://github.com/nslvdr/StageSwap/wiki/Privacy) |
+| Check exact behavior and limits | [Technical reference](https://github.com/nslvdr/StageSwap/wiki/Technical-reference) |
 
 ## Deliberate limits
 
-StageSwap provides video only, at 720p, with no OBS integration or HDR tone mapping. Recovery retries saved devices; it does not automatically choose replacements or handle docking and sleep/resume. See the [technical reference](https://github.com/NatanSlvdr/StageSwap/wiki/Technical-reference) for detailed limits.
+StageSwap provides video only, at 720p, with no OBS integration or HDR tone mapping. Recovery retries saved devices; it does not automatically choose replacements or handle docking and sleep/resume. See the [technical reference](https://github.com/nslvdr/StageSwap/wiki/Technical-reference) for detailed limits.
 
 ## Development
 
@@ -85,4 +85,4 @@ StageSwap is written in Rust. Start with the developer guide for the pinned tool
 - [Requirements traceability](docs/REQUIREMENTS_TRACEABILITY.md) — product contracts mapped to implementation and evidence
 - [Localization](docs/LOCALIZATION.md) — approved English, French, and Spanish terminology
 
-The project is source-available under the license in `Cargo.toml`. Pull requests are not currently accepted; use [issues](https://github.com/NatanSlvdr/StageSwap/issues) for reproducible bug reports.
+The project is source-available under the license in `Cargo.toml`. Pull requests are not currently accepted; use [issues](https://github.com/nslvdr/StageSwap/issues) for reproducible bug reports.

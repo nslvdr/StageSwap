@@ -15,7 +15,7 @@ use std::thread;
 
 #[cfg(windows)]
 pub(crate) const RELEASES_API: &str =
-    "https://api.github.com/repos/NatanSlvdr/StageSwap/releases?per_page=100";
+    "https://api.github.com/repos/nslvdr/StageSwap/releases?per_page=100";
 #[cfg(any(windows, test))]
 const RELEASE_ASSET_PREFIX: &str = "StageSwap_win64_v";
 #[cfg(windows)]
@@ -439,12 +439,12 @@ mod tests {
 
     fn releases_json() -> Vec<u8> {
         br#"[
-          {"tag_name":"v2.0.0","html_url":"https://github.com/NatanSlvdr/StageSwap/releases/tag/v2.0.0","draft":false,"prerelease":true,"assets":[
-            {"name":"StageSwap_win64_v2.0.0.exe","browser_download_url":"https://github.com/NatanSlvdr/StageSwap/releases/download/v2.0.0/StageSwap_win64_v2.0.0.exe","digest":"sha256:bbbb"},
-            {"name":"StageSwap_win64_v2.0.0.exe.sha256","browser_download_url":"https://github.com/NatanSlvdr/StageSwap/releases/download/v2.0.0/StageSwap_win64_v2.0.0.exe.sha256"}]},
-          {"tag_name":"v1.9.0","html_url":"https://github.com/NatanSlvdr/StageSwap/releases/tag/v1.9.0","draft":false,"prerelease":false,"assets":[
-            {"name":"StageSwap_win64_v1.9.0.exe","browser_download_url":"https://github.com/NatanSlvdr/StageSwap/releases/download/v1.9.0/StageSwap_win64_v1.9.0.exe"},
-            {"name":"StageSwap_win64_v1.9.0.exe.sha256","browser_download_url":"https://github.com/NatanSlvdr/StageSwap/releases/download/v1.9.0/StageSwap_win64_v1.9.0.exe.sha256"}]},
+          {"tag_name":"v2.0.0","html_url":"https://github.com/nslvdr/StageSwap/releases/tag/v2.0.0","draft":false,"prerelease":true,"assets":[
+            {"name":"StageSwap_win64_v2.0.0.exe","browser_download_url":"https://github.com/nslvdr/StageSwap/releases/download/v2.0.0/StageSwap_win64_v2.0.0.exe","digest":"sha256:bbbb"},
+            {"name":"StageSwap_win64_v2.0.0.exe.sha256","browser_download_url":"https://github.com/nslvdr/StageSwap/releases/download/v2.0.0/StageSwap_win64_v2.0.0.exe.sha256"}]},
+          {"tag_name":"v1.9.0","html_url":"https://github.com/nslvdr/StageSwap/releases/tag/v1.9.0","draft":false,"prerelease":false,"assets":[
+            {"name":"StageSwap_win64_v1.9.0.exe","browser_download_url":"https://github.com/nslvdr/StageSwap/releases/download/v1.9.0/StageSwap_win64_v1.9.0.exe"},
+            {"name":"StageSwap_win64_v1.9.0.exe.sha256","browser_download_url":"https://github.com/nslvdr/StageSwap/releases/download/v1.9.0/StageSwap_win64_v1.9.0.exe.sha256"}]},
           {"tag_name":"nightly","html_url":"https://example.invalid","draft":false,"prerelease":false,"assets":[]},
           {"tag_name":"v9.0.0","html_url":"https://example.invalid","draft":true,"prerelease":false,"assets":[]}
         ]"#.to_vec()

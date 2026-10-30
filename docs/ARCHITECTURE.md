@@ -1,6 +1,6 @@
 # Architecture
 
-This document explains how StageSwap implements its product contract. For build and release commands, see [Development](DEVELOPMENT.md). This is the repository reference for implementation behavior and limits; the [user wiki](https://github.com/NatanSlvdr/StageSwap/wiki) explains how to operate the app.
+This document explains how StageSwap implements its product contract. For build and release commands, see [Development](DEVELOPMENT.md). This is the repository reference for implementation behavior and limits; the [user wiki](https://github.com/nslvdr/StageSwap/wiki) explains how to operate the app.
 
 ## System boundaries
 
